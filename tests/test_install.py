@@ -14,6 +14,9 @@ from types import SimpleNamespace
 import pytest
 
 import boring_deploy  # the check environment has it (scripts/check.py)
+
+# install_steps.py runs inside the deploy launcher, which needs Python 3.11 or newer.
+pytestmark = pytest.mark.skipif(sys.version_info < (3, 11), reason="the deploy launcher needs Python 3.11 or newer")
 from boring_deploy import artifact
 from boring_pirates.common.ipc import DESCRIPTOR, settings
 from boring_pirates.common.profiles import TOOLS, parse_profiles
