@@ -1,0 +1,9 @@
+[Unit]
+Description=Boring Pirate @NAME@ - shared command budget across flavours
+
+[Slice]
+MemoryAccounting=yes
+TasksAccounting=yes
+MemoryMax=2G
+MemorySwapMax=0
+TasksMax=256

@@ -1,0 +1,14 @@
+{
+  "active": true,
+  "workdir": ".",
+  "allowed_tools": [
+    "file_list",
+    "file_patch",
+    "file_read",
+    "file_read_bytes",
+    "file_search",
+    "file_write",
+    "file_write_bytes"
+  ],
+  "max_turns": 12
+}

@@ -1,0 +1,17 @@
+[Unit]
+Description=Boring Pirate @NAME@ - fixed-UID per-command launcher
+Requires=system-pirate@NAME@.slice
+After=system-pirate@NAME@.slice
+
+[Socket]
+ListenStream=/run/boring-pirate-tasks/@NAME@.sock
+SocketUser=@ACCOUNT@
+SocketGroup=pirate-clients
+SocketMode=0600
+DirectoryMode=0755
+Accept=yes
+MaxConnections=4
+RemoveOnStop=yes
+
+[Install]
+WantedBy=multi-user.target

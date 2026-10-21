@@ -1,0 +1,29 @@
+[Unit]
+Description=Boring Pirate @NAME@ - contained command
+CollectMode=inactive-or-failed
+
+[Service]
+Type=exec
+Slice=system-pirate@NAME@.slice
+User=@ACCOUNT@
+Group=pirate-clients
+SupplementaryGroups=@GROUPS@
+UMask=0077
+ExecStart=@CODE@/current/bin/boring-worker-task --config /etc/boring-pirates/@NAME@/config.json --section execution
+StandardInput=socket
+StandardOutput=journal
+StandardError=journal
+KillMode=control-group
+TimeoutStopSec=1s
+RuntimeMaxSec=120s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=@HOME@/work
+ProtectControlGroups=yes
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryMax=512M
+TasksMax=128

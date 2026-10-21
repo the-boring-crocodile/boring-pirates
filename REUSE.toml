@@ -1,0 +1,13 @@
+version = 1
+
+# The last matching annotation wins.
+
+[[annotations]]
+path = ["**"]
+SPDX-FileCopyrightText = "2026 Wald and the boring-pirates contributors"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+[[annotations]]
+path = ["**/*.md", "docs/**"]
+SPDX-FileCopyrightText = "2026 Wald and the boring-pirates contributors"
+SPDX-License-Identifier = "CC-BY-SA-4.0"

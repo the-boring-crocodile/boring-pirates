@@ -1,0 +1,32 @@
+[Unit]
+Description=Boring Pirate @NAME@ - assignment listener
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@ACCOUNT@
+Group=pirate-clients
+SupplementaryGroups=@GROUPS@
+UMask=0027
+RuntimeDirectory=boring-pirate-@NAME@
+RuntimeDirectoryMode=0750
+StateDirectory=boring-pirate-@NAME@
+StateDirectoryMode=0700
+WorkingDirectory=@HOME@
+LoadCredential=@PROVIDER@-api-key:/etc/boring-pirates/@NAME@/credentials/@PROVIDER@-api-key
+ExecStart=@CODE@/current/bin/boring-pirate serve --config /etc/boring-pirates/@NAME@/config.json
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=@HOME@/work
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+MemoryMax=512M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+{
+  "id": "@ACCOUNT@",
+  "name": "@DISPLAY@",
+  "description": "Accepts bounded assignments and works in a dedicated workspace.",
+  "capabilities": [
+    "inspect files",
+    "edit text files",
+    "report results and remaining verification"
+  ],
+  "workspace_scope": "@HOME@/work"
+}
