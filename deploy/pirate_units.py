@@ -18,7 +18,10 @@ A deploy renders every Pirate's four units with the NEW release's templates:
     anything else (a hand edit, a        the deploy stops at its check, before any
     unit the record does not name, a     change, with the diff; the operator moves
     symlink)                             the edit into a drop-in and removes the
-                                         unit file, which the deploy then writes
+                                         unit file, which the deploy then writes;
+                                         a unit an earlier release installed
+                                         without a record (0.3.5) is named in the
+                                         record with its SHA-256 instead
 
 The values come from the host as it is: ACCOUNT and GROUPS from the record
 (install writes them there first), HOME from the account, PROVIDER from
@@ -288,8 +291,26 @@ def refusal(plans):
     names = sorted({p.name for p in plans if p.refused})
     return lines, _failure(
         "the units of " + ", ".join(names) + " differ from what a deploy wrote, so nothing is changed",
-        "hand edits belong in a drop-in (UNIT.d/*.conf; kept by every deploy): move the edit there, remove "
-        "the unit file (the deploy writes a unit that is absent) and run the deploy again")
+        refusal_hint([u for p in plans for u in p.refused]))
+
+
+EDITED_HINT = ("hand edits belong in a drop-in (UNIT.d/*.conf; kept by every deploy): move the edit there, "
+               "remove the unit file (the deploy writes a unit that is absent) and run the deploy again")
+UNRECORDED_HINT = (f"a unit the record does not name is replaced only once it is named: if it is as an earlier "
+                   f"release installed it (a 0.3.5 install has no record), add it to {RECORD}'s \"units\" "
+                   f"with its SHA-256 (sha256sum FILE) and the deploy replaces it, keeping a backup; if it holds "
+                   f"hand edits, move them to a drop-in (UNIT.d/*.conf) and remove the unit file")
+
+
+def refusal_hint(refused):
+    """What to do about the refused units: a changed unit was edited by hand; a unit
+    the record does not name may just be older than records (CHANGELOG, Upgrade)."""
+    hints = []
+    if any(u.recorded is not None for u in refused):
+        hints.append(EDITED_HINT)
+    if any(u.recorded is None for u in refused):
+        hints.append(UNRECORDED_HINT)
+    return "; ".join(hints)
 
 
 # -- apply -----------------------------------------------------------------------

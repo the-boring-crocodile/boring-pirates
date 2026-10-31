@@ -161,9 +161,69 @@ def test_an_unrecorded_unit_that_differs_is_refused(mo):
     record.write_text(json.dumps(document))
     change_template(mo, "boring-pirate-task@.service", "ProtectClock=yes")
     ctx, calls, logged = deploy_ctx(mo)
-    with pytest.raises(boring_deploy.Failure):
+    with pytest.raises(boring_deploy.Failure) as refused:
         mo.steps.plan_units(ctx)
     assert any("the record does not name it" in line for line in logged) and calls == []
+    assert "sha256sum" in refused.value.hint and "drop-in" in refused.value.hint
+    assert not refused.value.hint.startswith("hand edits")  # an unrecorded unit may simply predate records
+
+
+def test_a_changed_unit_gets_only_the_drop_in_hint(mo):
+    change_template(mo, "boring-pirate@.service", "# new")
+    unit = mo.units / "boring-pirate@mo.service"
+    unit.write_text(unit.read_text() + "# hand\n")
+    with pytest.raises(boring_deploy.Failure) as refused:
+        mo.steps.plan_units(deploy_ctx(mo)[0])
+    assert refused.value.hint.startswith("hand edits") and "sha256sum" not in refused.value.hint
+
+
+def test_a_clean_host_has_no_upgrade_steps(mo):
+    ctx, calls, logged = deploy_ctx(mo)
+    assert mo.steps.data_generation(ctx) is None
+    assert logged == [] and calls == []
+
+
+def test_check_reports_every_shape_of_a_0_3_5_install_at_once(mo):
+    """What a public 0.3.5 install leaves: the old keys, context_files, no record.
+    deploy --check runs only step 1, which asks data_generation: all of it is
+    reported there, read-only, before the deploy would refuse one at a time."""
+    config = mo.config / "mo" / "config.json"
+    config.write_text(json.dumps({"provider": "mistral", "socket": "/run/x/pirate.sock", "history_dir": "/var/lib/x",
+                                  "key_file": "/etc/x/key", "profiles": {
+                                      "default": {"model": "m", "context_files": ["/home/pirate-mo/handbook/I.md"]},
+                                      "other": {"model": "m", "handbook": "/h"}}}))
+    (mo.config / "mo" / "rendered.json").unlink()
+    before = snapshot(mo)
+    ctx, calls, logged = deploy_ctx(mo)
+    with pytest.raises(boring_deploy.Failure, match="5 things to change first; nothing is changed") as refused:
+        mo.steps.data_generation(ctx)
+    assert "CHANGELOG" in refused.value.hint
+    text = "\n".join(logged)
+    for expected in ("remove 'socket'", "remove 'history_dir'", "remove 'key_file'",
+                     "flavour default: replace 'context_files' with handbook", "rendered.json is missing"):
+        assert expected in text, expected
+    assert "flavour other" not in text
+    assert snapshot(mo) == before and calls == []
+
+
+def test_check_names_units_a_record_without_them_would_refuse(mo):
+    record = mo.config / "mo" / "rendered.json"
+    document = json.loads(record.read_text())
+    document["units"] = {}
+    record.write_text(json.dumps(document))
+    change_template(mo, "boring-pirate-task@.service", "ProtectClock=yes")
+    ctx, calls, logged = deploy_ctx(mo)
+    with pytest.raises(boring_deploy.Failure, match="1 thing to change first"):
+        mo.steps.data_generation(ctx)
+    (line,) = logged
+    assert "boring-pirate-task-mo@.service: not named by the record" in line and "sha256sum" in line
+    assert calls == []
+
+
+def test_an_unparsable_config_is_reported_by_the_check(mo):
+    (mo.config / "mo" / "config.json").write_text("{")
+    with pytest.raises(boring_deploy.Failure, match="1 thing to change first"):
+        mo.steps.data_generation(deploy_ctx(mo)[0])
 
 
 @pytest.mark.parametrize("record, message", [

@@ -13,6 +13,12 @@ The units are rendered again from the new release's templates (pirate_units.py):
 the check plans it and stops before any change when a unit is not what a deploy
 wrote; the `units` hook, the engine's last step before the switch, writes the
 changed units with a backup, so the switch's restart runs the Pirates on them.
+
+`deploy --check` runs only the engine's step 1, without the new code's venv, so
+it cannot parse the configuration as the release check does. It does report,
+with the standard library, every shape an upgrade must change first
+(upgrade_problems): all of them at once, the same list the deploy then starts
+with, before anything is prepared.
 """
 import json
 from dataclasses import dataclass
@@ -26,6 +32,13 @@ CONFIG_NAME = "config.json"  # CONFIG_DIR/NAME/config.json: one Pirate's configu
 STATE_BASE = Path("/var/lib")  # where systemd puts a system unit's StateDirectory=
 RUNTIME_BASE = Path("/run")  # and its RuntimeDirectory=
 SOCKET_NAME = "pirate.sock"  # common/ipc.py's: the Pirate's socket in its RuntimeDirectory=
+# Shapes earlier releases installed that this one refuses (CHANGELOG, Upgrade), and what replaces them.
+OLD_CONFIG_KEYS = {"socket": "the unit's RuntimeDirectory=", "history_dir": "the unit's StateDirectory=",
+                   "key_file": "the unit's LoadCredential="}  # gone in 0.3.9
+OLD_PROFILE_KEYS = {"context_files": "handbook (the one file it named)",
+                    "instructions": "handbook"}  # gone since 0.3.5 (PF1)
+
+
 @dataclass
 class Pirate:
     name: str
@@ -133,6 +146,52 @@ def _credentials(ctx, pirate):
     if not found:
         raise boring_deploy.Failure(f"{pirate.unit} has no LoadCredential=")
     return found
+
+
+def upgrade_problems(ctx):
+    """Every shape on the host this release refuses, as lines; read-only and standard
+    library only (deploy --check has no venv of the new release). The release check
+    remains the authority: it parses each configuration completely, as the Pirate."""
+    import boring_deploy
+    problems = []
+    for pirate in pirates():
+        try:
+            raw = json.loads(pirate.config.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as problem:
+            problems.append(f"{pirate.name}: {pirate.config} does not parse: {problem}")
+            continue  # the units are rendered from it too
+        if isinstance(raw, dict):
+            for key in sorted(set(raw) & set(OLD_CONFIG_KEYS)):
+                problems.append(f"{pirate.name}: {pirate.config}: remove {key!r} (now {OLD_CONFIG_KEYS[key]})")
+            profiles = raw.get("profiles")
+            for flavour, value in sorted(profiles.items() if isinstance(profiles, dict) else []):
+                for key in sorted(set(value) & set(OLD_PROFILE_KEYS) if isinstance(value, dict) else []):
+                    problems.append(f"{pirate.name}: flavour {flavour}: replace {key!r} with {OLD_PROFILE_KEYS[key]}")
+        try:
+            plan = pirate_units.plan(pirate.name, ctx.release.directory, ctx.home, ctx.release.version)
+        except boring_deploy.Failure as failure:
+            problems.append(f"{pirate.name}: {failure}" + (f" ({failure.hint})" if failure.hint else ""))
+            continue
+        for unit in plan.refused:
+            why = ("not named by the record" if unit.recorded is None else "changed since the last deploy")
+            problems.append(f"{pirate.name}: {unit.file}: {why}: {pirate_units.refusal_hint([unit])}")
+    return problems
+
+
+def data_generation(ctx):
+    """Pirates keep no versioned data: None. The engine asks this in its step 1, the
+    only step `deploy --check` runs, and the deploy asks it before preparing; so the
+    upgrade's shapes are reported here, all at once, before anything is written
+    (boring-deploy has no other step-1 hook yet)."""
+    import boring_deploy
+    problems = upgrade_problems(ctx)
+    if problems:
+        for line in problems:
+            ctx.log(line)
+        raise boring_deploy.Failure(
+            f"{len(problems)} thing{'s' if len(problems) > 1 else ''} to change first; nothing is changed",
+            "make each change as the CHANGELOG's Upgrade notes say, then deploy --check again")
+    return None
 
 
 def check(ctx):
