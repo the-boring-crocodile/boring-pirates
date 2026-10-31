@@ -104,7 +104,8 @@ and says so. Add `"account"` and `"groups"` (a list) to it, the values of the
 A Pirate installed by 0.3.5 or older has no record at all: write one with
 `"release": "hand"`, the account and groups, and under `"units"` its four unit
 files with their current SHA-256, so the deploy may replace them (CHANGELOG,
-0.3.9 upgrade notes).
+0.3.9 upgrade notes). `deploy --check` lists everything an upgrade still has
+to change, all at once, before the deploy itself refuses it.
 A rollback to 0.3.6rc9 or older leaves the units as the newer release wrote
 them (those releases do not render); the CHANGELOG says when a release's
 units need restoring from `units-backup-*` for that.

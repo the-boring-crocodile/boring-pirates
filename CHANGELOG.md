@@ -3,6 +3,22 @@
 Notable changes per release, newest first ([Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 [SemVer](https://semver.org/); tags `vX.Y.Z`, candidates `vX.Y.Z-rc.N`).
 
+## 0.3.10 — 2026-10-31
+
+Upgrades from 0.3.5, as the public upgrade test found them (built on Pond Common 0.7.11):
+
+- `deploy --check` reports every shape the deploy would refuse, all at once and read-only: the
+  configuration keys and flavour settings an upgrade removes (`socket`, `history_dir`, `key_file`;
+  `context_files`, `instructions`), a missing or pre-0.3.9 `rendered.json`, and each unit file the
+  deploy may not replace. The deploy starts with the same list, before it prepares anything;
+  before, `--check` passed and the deploy then refused one problem at a time.
+- The deploy's refusal for a unit `rendered.json` does not name says what fits a clean older
+  install too: name the unit with its SHA-256 and the deploy replaces it (keeping a backup); the
+  drop-in advice stays for units that were edited by hand.
+
+Upgrade: as for 0.3.9 (below); `deploy --check` now lists what is left to do. From 0.3.9 nothing
+changes on the host; the units render as 0.3.9 wrote them.
+
 ## 0.3.9 — 2026-10-30
 
 Everything since 0.3.5. Built on Pond Common 0.7.11.
@@ -53,7 +69,7 @@ Service and deploy:
   stopping".
 
 Upgrade, before the deploy (its check refuses the old shapes before any change and names one
-problem at a time; nothing changes until it passes):
+problem at a time; nothing changes until it passes; 0.3.10's `deploy --check` lists them all):
 
 - In each `/etc/boring-pirates/NAME/config.json`, remove `socket`, `history_dir` and `key_file`,
   and in each flavour replace `context_files` (and `instructions`) with `handbook`: the one file
