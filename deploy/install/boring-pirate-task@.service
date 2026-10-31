@@ -21,6 +21,13 @@ PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=@HOME@/work
+# Commands run as the Pirate's UID but reach neither its transcripts (its
+# StateDirectory, history_dir: other callers' assignments) nor its key (systemd
+# grants the Pirate's UID read access to the key in /run/credentials). The serve
+# process is not dumpable, so /proc/<its pid>/root cannot reach them either.
+InaccessiblePaths=-/var/lib/boring-pirate-@NAME@ -/run/credentials
+# Not PrivatePIDs=: the Pirate checks its runner by /proc/<pid> as the host sees
+# it (a PID namespace failed exec in the rehearsal, "unexpected runner identity").
 ProtectControlGroups=yes
 CapabilityBoundingSet=
 RestrictSUIDSGID=yes

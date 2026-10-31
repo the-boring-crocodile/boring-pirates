@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ctypes
 import glob
+import hashlib
 import json
 import logging
 import math
@@ -13,6 +15,7 @@ import signal
 import stat
 import sys
 from contextlib import suppress
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,7 +24,9 @@ from boring_registry import Watchdog
 from . import assignment, history
 from .history import JOB_ID, FileHistory
 from .limits import (MAX_ANSWER, MAX_CONTEXT, MAX_CONVERSATION, MAX_FRAME,
-                     MAX_PROMPT, MAX_TOOL_RESULT, DEFAULT_PROVIDER_TIMEOUT_SECONDS, positive_seconds)
+                     MAX_PROMPT, MAX_TOOL_RESULT, DEFAULT_PROVIDER_IDLE_SECONDS, DEFAULT_PROVIDER_TIMEOUT_SECONDS,
+                     positive_seconds)
+from .overrides import Caps, apply as apply_overrides
 from .profiles import LAYOUT, ProfileSpec, parse_profiles
 from .providers import provider as provider_folder
 from .protocol_json import decode_object
@@ -34,11 +39,14 @@ REGISTER_GLOB = "/run/boring-crocodile/guests/*/register.sock"
 SCAN_SECONDS = 3.0
 PRUNE_SECONDS = 3600.0
 CLIENT_TIMEOUT = 5.0
-REQUIRED = {"provider", "socket", "checkout", "history_dir", "key_file", "client_uids", "descriptor_file",
+REQUIRED = {"provider", "checkout", "client_uids", "descriptor_file",
             "default_timeout_seconds", "max_timeout_seconds", "retention_seconds", "profiles"}
-OPTIONAL = {"provider_request_timeout_seconds", "execution", "service_authority"}
+SOCKET_NAME = "pirate.sock"  # in the unit's RuntimeDirectory= (deploy/steps.py pings it there)
+OPTIONAL = {"provider_request_timeout_seconds", "provider_idle_timeout_seconds", "execution", "service_authority",
+            "provider_endpoint", "caps"}
 SHAPES = {"ping": {"operation", "flavour"}, "describe": {"operation", "flavour"},
           "run": {"operation", "flavour", "job_id", "assignment", "timeout_seconds"}}
+OPTIONAL_FIELDS = {"run": {"overrides"}}  # PF1; an older Pirate refuses the field (exact shapes)
 DESCRIPTOR = {"id", "name", "description", "capabilities", "workspace_scope"}
 log = logging.getLogger("boring_pirates")
 
@@ -49,7 +57,7 @@ class Config:
     socket: Path
     checkout: Path
     history_dir: Path
-    key_file: Path
+    key_file: Path | None  # None only for check-config outside the unit
     client_uids: frozenset[int]
     descriptor: dict
     default_timeout: float
@@ -59,31 +67,52 @@ class Config:
     profiles: dict[str, ProfileSpec]
     execution: EnvironmentSettings | None = None
     service_authority: LocalAuthority | None = None
+    provider_endpoint: str | None = None
+    provider_idle_timeout: float = DEFAULT_PROVIDER_IDLE_SECONDS
+    caps: Caps = Caps()
 
 
-def settings(path: Path, *, credential_loaded: bool = True) -> Config:
+def unit_directory(environment: Mapping[str, str], variable: str) -> Path:
+    """One of the directories systemd makes for the Pirate's unit (RuntimeDirectory=,
+    StateDirectory=, LoadCredential=) and names in the environment it starts with."""
+    value = environment.get(variable, "")
+    if not value or ":" in value or not os.path.isabs(value):
+        raise ValueError(f"${variable} must name one directory: the Pirate runs in its unit "
+                         "(boring-pirate@NAME.service), which sets it")
+    return Path(value)
+
+
+def settings(path: Path, *, environment: Mapping[str, str] | None = None, credential_loaded: bool = True) -> Config:
     """The Pirate's validated config.json; `serve` starts from it and the release check
     (deploy/steps.py) runs it as the Pirate with the new code, so the two cannot drift.
 
-    credential_loaded=False is that check: it runs outside the unit, where systemd's
-    LoadCredential= file does not exist, so the key file need not exist; its directory
-    is protected all the same. The check sets STATE_DIRECTORY as the unit would."""
+    The unit owns where the socket, the transcripts and the key are: systemd names
+    its directories in the environment (RUNTIME_DIRECTORY, STATE_DIRECTORY,
+    CREDENTIALS_DIRECTORY), so config.json does not repeat them.
+    credential_loaded=False is check-config run without the unit's LoadCredential=:
+    the key is then absent (key_file None)."""
+    environment = os.environ if environment is None else environment
     raw = decode_object(path.read_bytes())
-    if "provider" not in raw:
+    if "provider" not in raw or raw["provider"] is None:
         raise ValueError(LAYOUT)
     missing, unexpected = REQUIRED - set(raw), set(raw) - REQUIRED - OPTIONAL
     if missing or unexpected:
         raise ValueError(f"configuration keys: missing {sorted(missing)}, unexpected {sorted(unexpected)}")
-    if any(not isinstance(raw[k], str) or not raw[k] for k in ("socket", "checkout", "history_dir", "key_file", "descriptor_file")):
+    endpoint = provider_folder(raw["provider"]).validate_endpoint(raw.get("provider_endpoint"))
+    if any(not isinstance(raw[k], str) or not raw[k] for k in ("checkout", "descriptor_file")):
         raise ValueError("paths must be nonempty strings")
+    socket = unit_directory(environment, "RUNTIME_DIRECTORY") / SOCKET_NAME
+    history_dir = unit_directory(environment, "STATE_DIRECTORY")
+    key_file = None
+    if credential_loaded or environment.get("CREDENTIALS_DIRECTORY"):
+        key_file = unit_directory(environment, "CREDENTIALS_DIRECTORY") / f"{raw['provider']}-api-key"
     checkout = Path(raw["checkout"]).resolve(strict=True)
-    history_dir, descriptor_file = (Path(raw[k]).resolve(strict=True) for k in ("history_dir", "descriptor_file"))
-    key_file = Path(raw["key_file"]).resolve(strict=credential_loaded)
-    if any(p == checkout or checkout in p.parents for p in (history_dir, key_file, descriptor_file)):
-        raise ValueError("history, credential and descriptor cannot be inside the writable checkout")
-    info = os.lstat(raw["history_dir"])
+    history_dir, descriptor_file = history_dir.resolve(strict=True), Path(raw["descriptor_file"]).resolve(strict=True)
+    if any(p == checkout or checkout in p.parents for p in (history_dir, descriptor_file)):
+        raise ValueError("history and descriptor cannot be inside the writable checkout")
+    info = os.lstat(history_dir)
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
-        raise PermissionError("history_dir must be a private directory owned by the Pirate")
+        raise PermissionError("the state directory must be a private directory owned by the Pirate")
     uids = raw["client_uids"]
     if not isinstance(uids, list) or not uids or any(type(uid) is not int or uid < 1 for uid in uids):
         raise ValueError("client_uids must be a nonempty list of positive UIDs")
@@ -105,15 +134,19 @@ def settings(path: Path, *, credential_loaded: bool = True) -> Config:
         if not isinstance(value, dict) or set(value) != {"socket", "uid"} or not isinstance(value["socket"], str):
             raise ValueError("service_authority needs exactly socket and uid")
         authority = LocalAuthority(Path(value["socket"]), value["uid"])
-    # No file root may reach the key, the transcripts or the unit's state directory
-    # (systemd's $STATE_DIRECTORY; installed, that is history_dir).
-    state = tuple(Path(p) for p in os.environ.get("STATE_DIRECTORY", "").split(":") if p)
-    protected = (key_file.parent, history_dir, *state)
-    return Config(raw["provider"], Path(raw["socket"]), checkout, history_dir, key_file, frozenset(uids), descriptor,
-                  default_timeout, max_timeout, retention,
-                  positive_seconds(raw.get("provider_request_timeout_seconds", DEFAULT_PROVIDER_TIMEOUT_SECONDS),
-                                   "provider_request_timeout_seconds"),
-                  parse_profiles(raw["profiles"], checkout, raw["provider"], protected=protected), execution, authority)
+    # No file root may reach the transcripts (the unit's state directory) or the key.
+    protected = (history_dir, *((key_file.parent,) if key_file is not None else ()))
+    request_timeout = positive_seconds(raw.get("provider_request_timeout_seconds", DEFAULT_PROVIDER_TIMEOUT_SECONDS),
+                                       "provider_request_timeout_seconds")
+    idle_timeout = positive_seconds(raw.get("provider_idle_timeout_seconds",
+                                            min(DEFAULT_PROVIDER_IDLE_SECONDS, request_timeout)),
+                                    "provider_idle_timeout_seconds")
+    if idle_timeout > request_timeout:
+        raise ValueError("provider_idle_timeout_seconds exceeds provider_request_timeout_seconds")
+    return Config(raw["provider"], socket, checkout, history_dir, key_file, frozenset(uids), descriptor,
+                  default_timeout, max_timeout, retention, request_timeout,
+                  parse_profiles(raw["profiles"], checkout, raw["provider"], protected=protected), execution, authority,
+                  endpoint, idle_timeout, Caps.parse(raw.get("caps")))
 
 
 def refusal(code: str, message: str) -> dict:
@@ -140,15 +173,21 @@ async def exchange(path: Path, payload: dict, timeout: float | None = CLIENT_TIM
 
 
 class Pirate:
-    def __init__(self, config: Config, providers: dict, register_glob: str = REGISTER_GLOB):
+    def __init__(self, config: Config, providers: dict, register_glob: str = REGISTER_GLOB,
+                 make_provider=None):
         self.config = config
         self.providers = providers
+        # spec -> provider, for a run whose overrides change the tools or the settings
+        # (serve: the flavour's provider class on the Pirate's one client). None: the
+        # flavour's own provider is used (tests with scripted providers).
+        self.make_provider = make_provider
         self.runtime = ToolRuntime(config.execution, config.service_authority)
         self.flavours = {name: spec for name, spec in config.profiles.items() if spec.active}
         self.model_cards: dict[str, dict | None] = {}  # the provider's card per flavour (inspect)
         self.busy: set[str] = set()
         self.handlers: set[asyncio.Task] = set()
         self.register_glob = register_glob
+        self.stopping = False  # set by serve_instance before it cancels the running assignments
         # register socket -> (its owner uid, one watchdog per flavour, their tasks)
         self.ponds: dict[str, tuple[int, dict[str, Watchdog], list[asyncio.Task]]] = {}
 
@@ -192,8 +231,10 @@ class Pirate:
         except ValueError as error:
             return refusal("invalid_request", f"send one JSON object line: {error}")
         operation, name = request.get("operation"), request.get("flavour")
-        if not isinstance(operation, str) or set(request) != SHAPES.get(operation):
-            return refusal("invalid_request", "operations are ping, describe and run, each with exactly its fields")
+        if (not isinstance(operation, str) or operation not in SHAPES
+                or not SHAPES[operation] <= set(request) <= SHAPES[operation] | OPTIONAL_FIELDS.get(operation, set())):
+            return refusal("invalid_request", "operations are ping, describe and run, each with exactly its fields "
+                           "(run: and optionally overrides)")
         if not isinstance(name, str) or name not in self.flavours:
             return refusal("not_found", f"no active flavour {name!r}")
         if operation == "ping":
@@ -213,11 +254,13 @@ class Pirate:
         if name in self.model_cards:
             profile[spec.provider] = {**spec.settings, "model_card": self.model_cards[name]}
         return {**c.descriptor, "flavour": name, "profile": profile,
+                "allow_overrides": spec.allow_overrides, "caps": c.caps.public(),
                 "tool_runtime": {"exec_configured": self.runtime.executor is not None,
                     "exec_limits": self.runtime.executor.limits.public() if self.runtime.executor else None,
                     "services_configured": self.runtime.authority is not None}, "limits": {
             "default_timeout_seconds": c.default_timeout, "max_timeout_seconds": c.max_timeout,
             "provider_request_timeout_seconds": c.provider_request_timeout,
+            "provider_idle_timeout_seconds": c.provider_idle_timeout,
             "max_assignment_bytes": MAX_PROMPT, "max_answer_bytes": MAX_ANSWER,
             "max_context_bytes": MAX_CONTEXT, "max_conversation_bytes": MAX_CONVERSATION,
             "max_file_bytes": spec.files.limits["max_file_bytes"],
@@ -233,18 +276,36 @@ class Pirate:
             timeout = self.config.default_timeout
         elif type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= self.config.max_timeout:
             return refusal("invalid_request", f"timeout_seconds must be null or in (0, {self.config.max_timeout:g}]")
+        overrides = request.get("overrides")
+        spec, system = self.flavours[name], None
+        if "overrides" in request:
+            # Refused, never ignored: a caller must not believe a run used its prompt when it did not.
+            if not spec.allow_overrides:
+                return refusal("forbidden", f"flavour {name} does not accept overrides")
+            try:
+                spec, system = apply_overrides(spec, overrides, self.config.caps,
+                                               provider_folder(spec.provider).settings)
+            except ValueError as error:
+                return refusal("invalid_request", str(error))
         if name in self.busy:
             return refusal("busy", f"flavour {name} is running another assignment")
         self.busy.add(name)
+        cancel_reason: str | None = None
         try:
-            work = asyncio.create_task(self.execute(uid, name, job_id, prompt, float(timeout)))
+            work = asyncio.create_task(self.execute(uid, name, job_id, prompt, float(timeout),
+                                                    spec, system, overrides,
+                                                    cancellation_reason=lambda: cancel_reason))
             gone = asyncio.create_task(closed(reader))
             try:
                 await asyncio.wait({work, gone}, return_when=asyncio.FIRST_COMPLETED)
             finally:
                 gone.cancel()
                 if not work.done():
-                    work.cancel("client disconnected")
+                    # The transcript's reason: the service stopping cancels this handler too.
+                    # Keep the initiating cause outside the executor: its cleanup
+                    # may re-raise cancellation without the original message.
+                    cancel_reason = "Pirate service stopping" if self.stopping else "client disconnected"
+                    work.cancel(cancel_reason)
                 await asyncio.gather(work, return_exceptions=True)
             if work.cancelled():
                 return None
@@ -252,12 +313,28 @@ class Pirate:
         finally:
             self.busy.discard(name)
 
-    async def execute(self, uid: int, name: str, job_id: str, prompt: str, timeout: float) -> dict:
-        profile = self.flavours[name].resolve()
+    async def execute(self, uid: int, name: str, job_id: str, prompt: str, timeout: float,
+                      spec: ProfileSpec | None = None, system: str | None = None,
+                      overrides: dict | None = None, *,
+                      cancellation_reason: Callable[[], str | None] | None = None) -> dict:
+        """`spec`/`system`: the flavour after `overrides` (apply_overrides), else the flavour."""
+        own = self.flavours[name]
+        spec = spec or own
+        profile = spec.resolve(system)
+        provider = self.providers[name]
+        if self.make_provider is not None and (spec.tools != own.tools or spec.options != own.options):
+            provider = self.make_provider(spec)
+        system_sha256 = hashlib.sha256(profile.system_message().encode()).hexdigest()
         transcript = FileHistory(self.config.history_dir, job_id, name, uid, profile.spec.provider, profile.spec.model)
         try:
-            transcript.append("assignment", {"profile": profile.public(), "prompt": prompt, "timeout_seconds": timeout})
-            return await assignment.run(self.providers[name], self.config.checkout, profile, transcript, prompt, timeout, self.runtime)
+            record = {"profile": profile.public(), "prompt": prompt, "timeout_seconds": timeout,
+                      "system_sha256": system_sha256}
+            if overrides is not None:
+                record["overrides"] = overrides  # in full, the system text included: the run's evidence
+            transcript.append("assignment", record)
+            result = await assignment.run(provider, self.config.checkout, profile, transcript, prompt, timeout, self.runtime,
+                                          cancellation_reason=cancellation_reason)
+            return {**result, "overrides_used": overrides is not None, "system_sha256": system_sha256}
         finally:
             transcript.close()
 
@@ -334,18 +411,36 @@ async def closed(reader: asyncio.StreamReader) -> None:
         await reader.read(1)
 
 
+PR_SET_DUMPABLE = 4
+
+
+def not_dumpable() -> None:
+    """Keep the Pirate's own UID out of this process: its commands (exec) run as that
+    UID in other units, and /proc/<this pid>/ (root, mem, environ, fd) would let them
+    reach the key and the transcripts past their own sandbox. A process that is not
+    dumpable has those owned by root (the kernel checks this before Yama)."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "prctl(PR_SET_DUMPABLE, 0) failed")
+
+
 async def serve(config_path: Path) -> None:
     if os.getuid() == 0:
         raise SystemExit("Pirate service must run as an ordinary user")
+    not_dumpable()  # before the key is read
     config = settings(config_path)
+    if config.key_file is None:  # not reached: with the credential required, settings names the key
+        raise ValueError("no provider credential")
     key = config.key_file.read_text().strip()
     if not key:
         raise ValueError("empty provider credential")
     folder = provider_folder(config.provider)
-    client = folder.client(key, config.provider_request_timeout)
-    pirate = Pirate(config, {name: folder.Provider(spec.model, client, config.provider_request_timeout,
-                                           spec.tools, spec.settings)
-                     for name, spec in config.profiles.items() if spec.active})
+    client = folder.client(key, config.provider_request_timeout, endpoint=config.provider_endpoint)
+    def make_provider(spec: ProfileSpec):
+        return folder.Provider(spec.model, client, config.provider_request_timeout,
+                               spec.tools, spec.settings, idle_timeout=config.provider_idle_timeout)
+    pirate = Pirate(config, {name: make_provider(spec) for name, spec in config.profiles.items() if spec.active},
+                    make_provider=make_provider)
     async with client:
         await inspect_flavours(pirate, folder, client)
         await serve_instance(pirate)
@@ -391,6 +486,7 @@ async def serve_instance(pirate: Pirate) -> None:
             task.cancel()
         await asyncio.gather(*background, return_exceptions=True)
         handlers = list(pirate.handlers)
+        pirate.stopping = True
         for task in handlers:
             task.cancel("Pirate service stopping")
         await asyncio.gather(*handlers, return_exceptions=True)
@@ -404,10 +500,34 @@ async def serve_instance(pirate: Pirate) -> None:
             signal.signal(sig, handler)
 
 
+def check_config(path: Path) -> dict:
+    """What `serve` reads before it listens, checked as the account that runs this:
+    the configuration, every active flavour's context and digest files, and the
+    provider credential when it is there (inside the unit, LoadCredential= puts it
+    there; outside, it is absent and reported so). Raises on the first problem."""
+    not_dumpable()  # the release check runs as the Pirate with its key, like serve
+    config = settings(path, credential_loaded=False)
+    key = config.key_file if config.key_file is not None and config.key_file.exists() else None
+    if key is not None and not key.read_text().strip():
+        raise ValueError("empty provider credential")
+    flavours = {}
+    for name, spec in config.profiles.items():
+        if spec.active:
+            profile = spec.resolve()  # reads context and digest files now, as a run would
+            flavours[name] = {"model": spec.model, "revision": profile.revision,
+                              "context": list(profile.context_sources), "allowed_tools": sorted(spec.tools)}
+    return {"ok": True, "uid": os.getuid(), "provider": config.provider, "credential": "present" if key is not None
+            else "absent here (only inside the unit)", "provider_request_timeout_seconds": config.provider_request_timeout,
+            "provider_idle_timeout_seconds": config.provider_idle_timeout, "flavours": flavours,
+            "inactive": sorted(n for n, s in config.profiles.items() if not s.active)}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="A Boring Pirate: serve its flavours, or ask one as a client.")
     sub = parser.add_subparsers(dest="mode", required=True)
     sub.add_parser("serve").add_argument("--config", type=Path, required=True)
+    sub.add_parser("check-config", help="check a configuration as the account that runs this; "
+                   "run it as the Pirate (see docs/CONFIGURATION.md)").add_argument("--config", type=Path, required=True)
     for name in SHAPES:
         command = sub.add_parser(name)
         command.add_argument("--socket", type=Path, required=True)
@@ -419,6 +539,14 @@ def main() -> None:
     if args.mode == "serve":
         logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
         asyncio.run(serve(args.config))
+        return
+    if args.mode == "check-config":
+        try:
+            report = check_config(args.config)
+        except (OSError, ValueError) as error:
+            print(json.dumps({"ok": False, "uid": os.getuid(), "error": f"{type(error).__name__}: {error}"}))
+            raise SystemExit(1) from error
+        print(json.dumps(report, indent=2))
         return
     payload: dict = {"operation": args.mode, "flavour": args.flavour}
     timeout: float | None = CLIENT_TIMEOUT

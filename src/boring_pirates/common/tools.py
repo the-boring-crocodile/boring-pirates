@@ -16,9 +16,18 @@ SERVICES = [
     {"name": "service_describe", "description": "Describe tools of an allowed service",
      "parameters": {"type": "object", "properties": {"service": {"type": "string"}}, "required": ["service"],
                     "additionalProperties": False}},
-    {"name": "service_call", "description": "Call a service under this Pirate identity",
-     "parameters": {"type": "object", "properties": {"service": {"type": "string"}, "tool": {"type": "string"},
-                                                     "arguments": {"type": "object"}},
+    {"name": "service_call",
+     "description": ("Call a service under this Pirate identity. Content need not pass through you: any "
+                     'argument value may be {"$file": {"root": ..., "path": ..., "sha256": optional}}, '
+                     "replaced by that file's text (at most 512 KiB in all); save_to writes the answer to a "
+                     "file and returns saved_to instead (expected_sha256 null for a new file). If the save "
+                     "fails, the answer comes back with save_to_refused (nothing written) or save_to_failed "
+                     "(the file may still be written: check its hash before writing again)."),
+     "parameters": {"type": "object", "properties": {
+         "service": {"type": "string"}, "tool": {"type": "string"}, "arguments": {"type": "object"},
+         "save_to": {"type": "object", "properties": {"root": {"type": "string"}, "path": {"type": "string"},
+                                                      "expected_sha256": {"type": ["string", "null"]}},
+                     "required": ["root", "path", "expected_sha256"], "additionalProperties": False}},
                     "required": ["service", "tool", "arguments"], "additionalProperties": False}},
 ]
 # The worker kit's shared file and exec tools come in the chat "function" wrapping; unwrapped here.

@@ -48,6 +48,7 @@ def main():
     files["python.tar.gz"] = python
     files.update({name: ROOT / name for name in ("LICENSE", "COPYING.md")})
     files.update({f"install/{p.name}": p for p in sorted((ROOT / "deploy" / "install").iterdir())})
+    files["deploy.d/pirate_units.py"] = ROOT / "deploy" / "pirate_units.py"  # shared by steps and install
     release = {"component": "boring-pirates", "version": version, "runtime": "venv",
                "default_home": "/opt/boring-pirates", "python": "python.tar.gz",
                "commit": develop.git(ROOT, "rev-parse", "HEAD").strip()}

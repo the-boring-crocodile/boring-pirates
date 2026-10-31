@@ -1,18 +1,17 @@
-"""What Pirates use of Mistral's SDK, against a mocked Mistral over HTTP: the
-SDK's retries (429 and 5xx), its errors as our failure reasons, the model card
-at start (a flavour its model cannot serve is not offered), and the extra
-settings passed through."""
+"""Mistral over the common HTTP transport, against a mocked Mistral: retries (429
+and 5xx), errors as our failure reasons, the model card at start (a flavour its
+model cannot serve is not offered), and the extra settings passed through."""
 from __future__ import annotations
 
-import datetime
 import json
 
 import httpx
 
+from boring_pirates.common import chat
 from boring_pirates.common.providers import ProviderFailure
 from boring_pirates.mistral import provider as mistral
 import test_pirates as base
-from test_pirates import sdk_response
+from test_pirates import mistral_answer
 
 CARD = {"id": "model-a", "object": "model", "created": 1, "owned_by": "mistralai", "type": "base",
         "max_context_length": 131072, "aliases": [], "deprecation": None,
@@ -24,27 +23,32 @@ def mocked(*answers, seen=None):
     answers = list(answers)
 
     def respond(request):
+        sent = json.loads(request.content) if request.content else None
         if seen is not None:
-            seen.append((request.url.path, json.loads(request.content) if request.content else None))
+            seen.append((request.url.path, sent))
         status, body = answers.pop(0) if len(answers) > 1 else answers[0]
+        if status == 200 and isinstance(sent, dict) and sent.get("stream") is True:
+            # A streamed request: the same answer as Mistral streams it (server-sent events).
+            events = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in base.stream_chunks(body)) + "data: [DONE]\n\n"
+            return httpx.Response(200, content=events.encode(), headers={"content-type": "text/event-stream"})
         return httpx.Response(status, json=body)
-    return mistral.client("synthetic", 1.5, httpx.AsyncClient(transport=httpx.MockTransport(respond)))
+    return mistral.client("synthetic", 1.5, transport=httpx.MockTransport(respond))
 
 
-OK = (200, sdk_response("stop", "ok").model_dump(mode="json"))
+OK = (200, mistral_answer("stop", "ok"))
 
 
-class SDKTest(base.TempCase):
+class MistralTest(base.TempCase):
     run_with = base.AssignmentTest.run_with
 
     async def asyncSetUp(self):
         await super().asyncSetUp()
         self.config = base.settings(base.make_site(self.root))
-        self.backoff = mistral.BACKOFF_MS
-        mistral.BACKOFF_MS = (10, 40)  # the SDK's waits, short for the test
-        self.addCleanup(setattr, mistral, "BACKOFF_MS", self.backoff)
+        self.backoff = chat.BACKOFF_SECONDS
+        chat.BACKOFF_SECONDS = (0.01, 0.04)  # short waits for the test
+        self.addCleanup(setattr, chat, "BACKOFF_SECONDS", self.backoff)
 
-    async def test_the_sdk_retries_429_and_5xx_and_then_answers(self):
+    async def test_429_and_5xx_are_retried_and_then_answered(self):
         seen = []
         provider = mistral.MistralProvider("model-a", mocked((429, {"message": "slow down"}), (503, {}), OK, seen=seen))
         turn = await provider.complete([{"role": "user", "content": "hi"}])
@@ -55,7 +59,8 @@ class SDKTest(base.TempCase):
                                (429, "rate_limited"), (503, "unavailable")):
             with self.subTest(status=status):
                 seen = []
-                provider = mistral.MistralProvider("model-a", mocked((status, {"message": "no"}), seen=seen))
+                provider = mistral.MistralProvider("model-a", mocked((status, {"message": "no"}), seen=seen),
+                                                   request_timeout=0.5)  # retries end with the budget
                 with self.assertRaises(ProviderFailure) as caught:
                     await provider.complete([{"role": "user", "content": "hi"}])
                 self.assertEqual(caught.exception.reason, reason)
@@ -82,6 +87,21 @@ class SDKTest(base.TempCase):
                            ("safe_prompt", True), ("presence_penalty", 0.2), ("max_tokens", 8192)):
             self.assertEqual(body[key], value, key)
         self.assertNotIn("frequency_penalty", body)
+
+    async def test_a_streamed_answer_and_stream_false(self):
+        seen = []
+        calls = (200, mistral_answer("tool_calls", calls=[("a", "file_list", {"root": "work", "path": "."})]))
+        turn = await mistral.MistralProvider("model-a", mocked(calls, seen=seen)).complete([{"role": "user", "content": "hi"}])
+        self.assertEqual((turn.finish_reason, turn.calls), ("tool_calls", [{"id": "a", "name": "file_list",
+                                                                            "arguments": {"root": "work", "path": "."}}]))
+        self.assertEqual((turn.usage["prompt_tokens"], turn.model), (5, "test-model"))
+        self.assertTrue(seen[0][1]["stream"])
+        seen.clear()
+        whole = mistral.MistralProvider("model-a", mocked(OK, seen=seen), options=mistral.settings({"stream": False}, "a"))
+        self.assertEqual((await whole.complete([{"role": "user", "content": "hi"}])).text, "ok")
+        self.assertFalse(seen[0][1].get("stream", False))
+        with self.assertRaisesRegex(ValueError, "stream must be true or false"):
+            mistral.settings({"stream": "yes"}, "a")
 
 
 class CardTest(base.SocketCase):
@@ -124,5 +144,3 @@ class CardTest(base.SocketCase):
         described = (await self.ask("describe", "beta"))["result"]["profile"]["mistral"]
         self.assertEqual((described["max_tokens"], described["model_card"]["max_context_length"]), (8192, 131072))
 
-
-assert datetime  # (dates arrive as text and are parsed by the SDK)
