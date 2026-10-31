@@ -8,7 +8,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch, AsyncMock
+from unittest.mock import ANY, patch, AsyncMock
 
 from boring_pirates.common import assignment
 from boring_pirates.common.history import FileHistory
@@ -22,7 +22,7 @@ from boring_worker_kit.settings import EnvironmentSettings
 from boring_worker_kit.task_client import ContainmentError
 from boring_worker_kit.services import ServiceFailure
 from boring_worker_kit.files import FileTools
-from test_pirates import make_site, Script, tool_call, answer, records, UID
+from test_pirates import make_site, unit_environment, Script, tool_call, answer, records, UID
 
 class ToolCase(unittest.IsolatedAsyncioTestCase):
     """Set-up and helpers for the tool tests; no tests of its own."""
@@ -33,7 +33,7 @@ class ToolCase(unittest.IsolatedAsyncioTestCase):
         self.config = settings(make_site(self.root, profiles={'alpha': {'active': True, 'model': 'synthetic',
             'allowed_tools': ['file_read', 'file_write', 'file_patch', 'file_read_bytes', 'file_write_bytes',
                               'file_list', 'file_search', 'exec', 'service_list', 'service_describe', 'service_call'],
-            'allowed_services': ['canvas']}}))
+            'allowed_services': ['canvas']}}), environment=unit_environment(self.root))
         self.spec = self.config.profiles['alpha']
         self.job = 'a'*32
 
@@ -167,7 +167,9 @@ class SharedToolTest(ToolCase):
                 tool_call('4','service_call',service='canvas',tool='write',arguments={'text':'y'}),
                 answer('unknown effects')), runtime)
         self.assertEqual(authority.request.await_count, 3)
-        call.assert_awaited_once_with('canvas', 'write', {'text':'x'}, 'parrot-token', grant={'name':'canvas','url':'https://canvas.test/mcp'})
+        call.assert_awaited_once_with('canvas', 'write', {'text':'x'}, 'parrot-token', grant={'name':'canvas','url':'https://canvas.test/mcp'},
+                                     timeout=ANY)
+        self.assertLessEqual(call.await_args.kwargs['timeout'], 30)  # the service contract caps the time left
         self.assertEqual(runtime.services.pond, 'pirate/parrot')  # set once; another caller is a failure
         outcomes=[x['data'] for x in self.trail() if x['kind']=='tool_result']
         self.assertEqual([x['name'] for x in outcomes[0]['value']['services']], ['canvas'])
@@ -175,6 +177,131 @@ class SharedToolTest(ToolCase):
         self.assertEqual(outcomes[2]['failure']['effects'], 'unknown')
         self.assertIn("caller 'pirate/other'", outcomes[3]['error'])
         self.assertEqual(result['tool_errors_count'], 3)
+
+    async def test_service_call_takes_file_references_and_save_to(self):
+        (self.config.checkout / 'note.txt').write_bytes(b'line one\r\nline two\n')
+        grant = {'caller': 'pirate/parrot', 'token': 'parrot-token',
+                 'grant': {'name': 'canvas', 'url': 'https://canvas.test/mcp'}}
+        authority = AsyncMock()
+        authority.request.side_effect = [dict(grant), dict(grant), dict(grant)]
+        runtime = ToolRuntime(authority=authority)
+        self.addAsyncCleanup(runtime.close)
+        call = AsyncMock(return_value={'content': [{'type': 'text', 'text': 'drawn'}]})
+        root = 'work'  # the checkout
+        reference = {'$file': {'root': root, 'path': 'note.txt'}}
+        with patch.object(Services, 'call', call):
+            result = await self.run_script(Script(
+                tool_call('1', 'service_call', service='canvas', tool='write', arguments={'text': reference}),
+                tool_call('2', 'service_call', service='canvas', tool='write', arguments={'text': 'y'},
+                          save_to={'root': root, 'path': 'answer.txt', 'expected_sha256': None}),
+                tool_call('3', 'service_call', service='canvas', tool='write', arguments={},
+                          save_to={'root': root, 'path': 'missing-dir/answer.txt', 'expected_sha256': None}),
+                tool_call('4', 'service_call', service='canvas', tool='write', arguments={},
+                          save_to={'root': root, 'path': 'x'}),
+                answer('done')), runtime, timeout=30)  # save_to keeps 5 s of the assignment back
+        # The service saw the file's exact text (line ends kept), never the reference.
+        self.assertEqual(call.await_args_list[0].args[2], {'text': 'line one\r\nline two\n'})
+        self.assertEqual((self.config.checkout / 'answer.txt').read_text(), 'drawn')
+        self.assertEqual(call.await_count, 2)  # missing directory and malformed save_to: refused before the call
+        self.assertEqual(authority.request.await_count, 2)  # a token only right before a call is sent
+        outcomes = [x['data'] for x in self.trail() if x['kind'] == 'tool_result']
+        self.assertEqual(outcomes[1]['value']['saved_to']['path'], 'answer.txt')
+        self.assertEqual([outcomes[2]['status'], outcomes[3]['status']], ['refused', 'refused'])
+        self.assertEqual(result['tool_errors_count'], 2)
+        # The saved answer counts as a write: write actions, reminders and the FILES check see it.
+        self.assertEqual([w['path'] for w in result['write_actions']], ['answer.txt'])
+
+    async def test_a_failed_save_is_a_failed_observation_and_stops_the_turn(self):
+        # Review finding F1: the service answered but the save did not land (disk full). The model
+        # sees the answer and a failure; a later call of the same turn, which may rely on
+        # the file, does not run.
+        from test_pirates import Turn
+        real = FileTools._file_call
+
+        def full(tools, operation, request):
+            if operation == 'file_write' and request.get('path') == 'answer.json':
+                raise OSError(28, 'No space left on device')
+            return real(tools, operation, request)
+        authority = AsyncMock()
+        authority.request.return_value = {'caller': 'pirate/parrot', 'token': 't',
+                                          'grant': {'name': 'canvas', 'url': 'https://canvas.test/mcp'}}
+        runtime = ToolRuntime(authority=authority)
+        self.addAsyncCleanup(runtime.close)
+        call = AsyncMock(return_value={'content': [{'type': 'text', 'text': 'drawn'}]})
+        calls = [{'id': '1', 'name': 'service_call', 'arguments': {
+                     'service': 'canvas', 'tool': 'w', 'arguments': {},
+                     'save_to': {'root': 'work', 'path': 'answer.json', 'expected_sha256': None}}},
+                 {'id': '2', 'name': 'file_write', 'arguments': {
+                     'root': 'work', 'path': 'after.txt', 'content': 'x', 'expected_sha256': None}}]
+        with patch.object(Services, 'call', call), patch.object(FileTools, '_file_call', full):
+            result = await self.run_script(Script(
+                Turn({'role': 'assistant', 'content': None}, calls, '', 'tool_calls', {}, 'm'),
+                answer('done')), runtime, timeout=30)
+        outcomes = [x['data'] for x in self.trail() if x['kind'] == 'tool_result']
+        first, second = outcomes
+        self.assertFalse(first['ok'])
+        self.assertEqual((first['code'], first['failure']['effects']), ('save_to_failed', 'unknown'))
+        self.assertEqual(first['value']['content'], [{'type': 'text', 'text': 'drawn'}])  # the answer is kept
+        self.assertEqual(second['status'], 'not_started')
+        self.assertFalse((self.config.checkout / 'after.txt').exists())
+        self.assertEqual(call.await_count, 1)
+        self.assertEqual(result['write_actions_count'], 0)
+        self.assertEqual(result['tool_errors_count'], 1)
+
+    async def test_a_save_that_lands_at_the_timeout_still_counts_as_a_write(self):
+        # The assignment times out while the save is writing: the write is waited for, so
+        # write_actions and the transcript have it before the Pirate answers.
+        import threading
+        from boring_worker_kit import file_refs
+        from boring_worker_kit.files import FileTools
+        release, real = threading.Event(), FileTools._file_call
+
+        def slow_write(tools, operation, request):
+            if operation == 'file_write' and request.get('path') == 'late.txt':
+                release.wait(3)
+            return real(tools, operation, request)
+        authority = AsyncMock()
+        authority.request.return_value = {'caller': 'pirate/parrot', 'token': 't',
+                                          'grant': {'name': 'canvas', 'url': 'https://canvas.test/mcp'}}
+        runtime = ToolRuntime(authority=authority)
+        self.addAsyncCleanup(runtime.close)
+
+        async def answer_slowly(*args, **kwargs):
+            await asyncio.sleep(0.85)  # little time left for the save, which then stalls past the deadline
+            return {'content': [{'type': 'text', 'text': 'late'}]}
+        threading.Timer(2.0, release.set).start()
+        with patch.object(Services, 'call', answer_slowly), patch.object(FileTools, '_file_call', slow_write), \
+                patch.object(file_refs, 'REPLY_MARGIN_SECONDS', 0.1), patch.object(file_refs, 'SAVE_FLOOR_SECONDS', 0.0):
+            result = await self.run_script(Script(
+                tool_call('1', 'service_call', service='canvas', tool='w', arguments={},
+                          save_to={'root': 'work', 'path': 'late.txt', 'expected_sha256': None}),
+                answer('never')), runtime, timeout=1)
+        self.assertEqual(result['state'], 'timed_out')
+        self.assertEqual([w['path'] for w in result['write_actions']], ['late.txt'])
+        self.assertEqual((self.config.checkout / 'late.txt').read_text(), 'late')
+        late = [x['data'] for x in self.trail() if x['kind'] == 'tool_result']
+        self.assertTrue(late[-1]['settled_after_cancellation'])
+
+    async def test_save_to_and_file_references_need_the_flavours_file_tools(self):
+        (self.config.checkout / 'note.txt').write_text('x')
+        authority = AsyncMock()
+        authority.request.return_value = {'caller': 'pirate/parrot', 'token': 't',
+                                          'grant': {'name': 'canvas', 'url': 'https://canvas.test/mcp'}}
+        runtime = ToolRuntime(authority=authority)
+        self.addAsyncCleanup(runtime.close)
+        call = AsyncMock(return_value={'content': []})
+        spec = replace(self.spec, tools=frozenset({'service_call'}))
+        with patch.object(Services, 'call', call):
+            await self.run_script(Script(
+                tool_call('1', 'service_call', service='canvas', tool='w', arguments={'a': [{'$file': {'root': 'work', 'path': 'note.txt'}}]}),
+                tool_call('2', 'service_call', service='canvas', tool='w', arguments={},
+                          save_to={'root': 'work', 'path': 'o.txt', 'expected_sha256': None}),
+                answer('done')), runtime, spec=spec, timeout=30)
+        outcomes = [x['data'] for x in self.trail() if x['kind'] == 'tool_result']
+        self.assertEqual([o.get('code') for o in outcomes], ['forbidden', 'forbidden'])
+        call.assert_not_awaited()
+        authority.request.assert_not_awaited()  # refused before any token
+        self.assertFalse((self.config.checkout / 'o.txt').exists())
 
 
 def png(width, height):

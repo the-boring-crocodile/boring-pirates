@@ -31,6 +31,7 @@ def release(tmp_path):
     out.mkdir()
     files = {f"install/{p.name}": p for p in sorted(INSTALL.iterdir())}
     files.update({name: ROOT / name for name in ("LICENSE", "COPYING.md")})  # a release carries its licence
+    files["deploy.d/pirate_units.py"] = ROOT / "deploy" / "pirate_units.py"  # as scripts/build.py adds it
     archive = artifact.assemble(out, {"component": "boring-pirates", "version": "1.0.0", "runtime": "venv",
                                       "default_home": "/opt/boring-pirates", "python": "python.tar.gz"},
                                 ROOT / "deploy/steps.py", files, install=ROOT / "deploy/install.py")
@@ -41,18 +42,20 @@ def release(tmp_path):
 def host(release, tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "dont_write_bytecode", True)
     monkeypatch.syspath_prepend(str(release / "deploy.d"))
-    for name in ("install_steps", "boring_install", "steps"):
+    for name in ("install_steps", "boring_install", "steps", "pirate_units"):
         sys.modules.pop(name, None)
     steps = importlib.import_module("steps")
     install = importlib.import_module("install_steps")
     units, config = tmp_path / "units", tmp_path / "etc-boring-pirates"
     units.mkdir()
     config.mkdir()
-    monkeypatch.setattr(steps, "UNITS_DIR", units)
-    monkeypatch.setattr(steps, "CONFIG_DIR", config)
+    for module in (steps, steps.pirate_units):
+        monkeypatch.setattr(module, "UNITS_DIR", units)
+        monkeypatch.setattr(module, "CONFIG_DIR", config)
     monkeypatch.setattr(install, "CROCODILE_CONFIG", tmp_path / "crocodile.toml")
     monkeypatch.setattr(install, "STATE", tmp_path / "var-lib")
-    return SimpleNamespace(steps=steps, install=install, units=units, config=config, release=release)
+    return SimpleNamespace(steps=steps, install=install, units=units, config=config, release=release,
+                           pirate_units=steps.pirate_units)
 
 
 def ctx(host, instance):
@@ -69,7 +72,7 @@ def test_no_pirate_is_a_failure_with_the_install_hint(host):
 def test_deploy_offers_name_and_the_first_install_settings(release):
     result = subprocess.run([sys.executable, str(release / "deploy"), "--help"], capture_output=True, text=True)
     assert result.returncode == 0
-    for option in ("--name", "--ponds", "--provider", "--model", "--key-file", "--install"):
+    for option in ("--name", "--ponds", "--provider", "--model", "--key-file", "--endpoint", "--install"):
         assert option in result.stdout
     remove = subprocess.run([sys.executable, str(release / "uninstall"), "--help"], capture_output=True, text=True)
     assert remove.returncode == 0 and "--name" in remove.stdout
@@ -112,7 +115,7 @@ def test_templates_render_completely_and_the_default_flavour_parses(host, tmp_pa
     assert json.loads(host.install._template(probe, "descriptor.json", values))["workspace_scope"] == \
         "/home/pirate-mo/work"
     profile = json.loads((INSTALL / "profile.json").read_text())
-    profile.update(model="mistral-small-2603", context_files=[])
+    profile.update(model="mistral-small-2603", handbook=None)
     (tmp_path / "work").mkdir()
     specs = parse_profiles({"default": profile}, tmp_path / "work", "mistral", protected=())
     assert specs["default"].active
@@ -137,20 +140,25 @@ def installed(host, tmp_path, client_uids):
               "CODE": "/opt/boring-pirates", "PROVIDER": "mistral", "GROUPS": ""}
     for document in ("INSTRUCTIONS.md", "descriptor.json"):
         (home / "handbook" / document).write_text(host.install.render(host.release, document, values))
-    site = host.install.site_document(host.release, name="mo", home=home, state=state, provider="mistral",
+    site = host.install.site_document(host.release, name="mo", home=home, provider="mistral",
                                       model="mistral-small-2603", client_uids=client_uids,
                                       authority={"socket": "/run/boring-crocodile-authority/pirate-services.sock",
                                                  "uid": 997})
     (tmp_path / "credentials").mkdir()  # as /run/credentials/UNIT/: no file root may reach it
-    (tmp_path / "credentials" / "key").write_text("synthetic")
-    site.update(key_file=str(tmp_path / "credentials" / "key"), socket=str(tmp_path / "mo.sock"))
+    (tmp_path / "credentials" / "mistral-api-key").write_text("synthetic")
     path = tmp_path / "config.json"
     path.write_text(json.dumps(site))
     return path
 
 
+def unit_environment(tmp_path):
+    """The directories systemd names to the unit of the Pirate `installed` writes."""
+    return {"RUNTIME_DIRECTORY": str(tmp_path), "STATE_DIRECTORY": str(tmp_path / "state"),
+            "CREDENTIALS_DIRECTORY": str(tmp_path / "credentials")}
+
+
 def test_what_install_writes_loads_with_one_flavour(host, tmp_path):
-    config = settings(installed(host, tmp_path, [os.getuid() + 1]))
+    config = settings(installed(host, tmp_path, [os.getuid() + 1]), environment=unit_environment(tmp_path))
     assert config.provider == "mistral" and sorted(config.profiles) == ["default"]
     default = config.profiles["default"]
     # exec, services and view_image (vision models only) are opt-in per flavour.
@@ -161,42 +169,85 @@ def test_what_install_writes_loads_with_one_flavour(host, tmp_path):
 
 def test_a_pirate_without_clients_refuses_to_start(host, tmp_path):
     with pytest.raises(ValueError, match="client_uids"):
-        settings(installed(host, tmp_path, []))
+        settings(installed(host, tmp_path, []), environment=unit_environment(tmp_path))
 
 
-def run_check(host, tmp_path, monkeypatch, extra_profiles=None):
+def run_check(host, tmp_path, monkeypatch, extra_profiles=None, key="synthetic\n", dropins=()):
     """steps.check on a host with Pirate mo as install writes it (its key file only in
     the unit's /run/credentials, absent here). systemctl answers as the unit would;
-    the emitted probe runs unchanged in a subprocess on the current source (this
-    interpreter, without -I, which would drop PYTHONPATH)."""
+    systemd-run is played here: its properties are checked, and the command runs on
+    the current source (this interpreter, without -I, which would drop PYTHONPATH)
+    with STATE_DIRECTORY, RUNTIME_DIRECTORY and CREDENTIALS_DIRECTORY as systemd sets them."""
     site = json.loads(installed(host, tmp_path, [os.getuid() + 1]).read_text())
-    site["key_file"] = "/run/credentials/boring-pirate@mo.service/mistral-api-key"
     site["profiles"].update(extra_profiles or {})
-    (host.config / "mo").mkdir()
+    (host.config / "mo" / "credentials").mkdir(parents=True)
     (host.config / "mo" / "config.json").write_text(json.dumps(site))
-    (host.units / "boring-pirate@mo.service").write_text("[Service]\n")
+    if key is not None:
+        (host.config / "mo" / "credentials" / "mistral-api-key").write_text(key)
+    source = host.config / "mo" / "credentials" / "mistral-api-key"
+    (host.units / "boring-pirate@mo.service").write_text(
+        f"[Service]\nUser=pirate-mo\nLoadCredential=mistral-api-key:{source}\n")
     monkeypatch.setattr(host.steps, "STATE_BASE", tmp_path)
+    monkeypatch.setattr(host.steps, "RUNTIME_BASE", tmp_path)
     new = tmp_path / "new-release"
-    probes, logged = [], []
+    runs, logged = [], []
 
-    def run(*command, user=None, **options):
+    def run(*command, user=None, check=True, **options):
         if command[0] == "systemctl":
-            answer = {"User": "pirate-mo", "StateDirectory": "state"}[command[3]]
+            answer = {"User": "pirate-mo", "Group": "pirate-clients", "StateDirectory": "state",
+                      "RuntimeDirectory": "boring-pirate-mo",
+                      "SupplementaryGroups": "pond-engineering", "WorkingDirectory": "/home/pirate-mo",
+                      "DropInPaths": " ".join(map(str, dropins))}[command[3]]
             return subprocess.CompletedProcess(command, 0, answer + "\n", "")
-        assert command[:3] == (str(new / "app" / "bin" / "python3"), "-I", "-c") and user == "pirate-mo"
-        probes.append(command[3:])
-        result = subprocess.run([sys.executable, "-c", *command[3:]], capture_output=True, text=True)
-        if result.returncode != 0:
-            raise boring_deploy.Failure(f"probe exited {result.returncode}: {result.stderr.strip()[-400:]}")
-        return result
+        assert command[0] == "systemd-run" and user is None and check is False
+        split = command.index(str(new / "app" / "bin" / "python3"))
+        pairs = [value.split("=", 1) for flag, value in zip(command[5:split:2], command[6:split:2])]
+        properties = {key: value for key, value in pairs if key != "Environment"}
+        environment = dict(value.split("=", 1) for key, value in pairs if key == "Environment")
+        runs.append(({**properties, "Environment": environment}, command[split + 1:]))
+        credentials = tmp_path / "unit-credentials"
+        credentials.mkdir(exist_ok=True)
+        ident, source = properties["LoadCredential"].split(":", 1)
+        if not Path(source).exists():  # systemd does not start a unit whose credential is missing
+            return subprocess.CompletedProcess(command, 1, "", "Job failed: credentials could not be set up")
+        (credentials / ident).write_text(Path(source).read_text())
+        env = {**os.environ, "CREDENTIALS_DIRECTORY": str(credentials), **environment}
+        return subprocess.run([sys.executable, *command[split + 2:]], capture_output=True, text=True, env=env)
+    monkeypatch.setattr(host.steps, "plan_units", lambda ctx: [])  # the units' own tests: test_render.py
     host.steps.check(SimpleNamespace(new=new, run=run, log=logged.append))
-    return probes, logged
+    return runs, logged
 
 
-def test_the_release_check_runs_the_services_settings_as_installed(host, tmp_path, monkeypatch):
-    probes, logged = run_check(host, tmp_path, monkeypatch)
-    assert probes == [(host.steps.PROBE, str(host.config / "mo" / "config.json"), str(tmp_path / "state"))]
-    assert logged == ["mo: configuration parses; active flavours: default"]
+def test_the_release_check_runs_check_config_as_the_pirate_with_its_key(host, tmp_path, monkeypatch):
+    runs, logged = run_check(host, tmp_path, monkeypatch)
+    ((properties, command),) = runs
+    # No StateDirectory= or RuntimeDirectory=: systemd would apply this unit's mode to
+    # the live state directory, and remove the live runtime directory when it ends.
+    assert properties == {"User": "pirate-mo", "Group": "pirate-clients",
+                          "Environment": {"STATE_DIRECTORY": str(tmp_path / "state"),
+                                          "RUNTIME_DIRECTORY": str(tmp_path / "boring-pirate-mo")},
+                          "SupplementaryGroups": "pond-engineering", "WorkingDirectory": "/home/pirate-mo",
+                          "LoadCredential": f"mistral-api-key:{host.config / 'mo' / 'credentials' / 'mistral-api-key'}",
+                          "NoNewPrivileges": "yes", "PrivateTmp": "yes", "ProtectSystem": "strict",
+                          "ProtectHome": "read-only"}
+    assert command == ("-I", "-m", "boring_pirates.common.ipc", "check-config", "--config",
+                       str(host.config / "mo" / "config.json"))
+    assert logged == ["mo: configuration parses; key present; active flavours: default"]
+
+
+def test_the_release_check_follows_drop_ins_for_the_key(host, tmp_path, monkeypatch):
+    other = tmp_path / "other-key"
+    other.write_text("synthetic\n")
+    reset = tmp_path / "10-key.conf"
+    reset.write_text(f"[Service]\nLoadCredential=\nLoadCredential = mistral-api-key:{other}\n")
+    runs, _ = run_check(host, tmp_path, monkeypatch, dropins=[reset])
+    assert runs[0][0]["LoadCredential"] == f"mistral-api-key:{other}"  # reset, then the drop-in's own
+
+
+@pytest.mark.parametrize("key, message", [(None, "credentials could not be set up"), ("  \n", "empty provider credential")])
+def test_the_release_check_refuses_a_missing_or_empty_key(host, tmp_path, monkeypatch, key, message):
+    with pytest.raises(boring_deploy.Failure, match=f"mo: configuration refused: .*{message}"):
+        run_check(host, tmp_path, monkeypatch, key=key)
 
 
 @pytest.mark.parametrize("reach", ["state", "/run/credentials/boring-pirate@mo.service"])
@@ -204,7 +255,7 @@ def test_the_release_check_refuses_a_file_root_on_a_protected_directory(host, tm
     profile = json.loads((INSTALL / "profile.json").read_text())
     path = str(tmp_path / reach) if reach == "state" else reach
     profile.update(model="mistral-small-2603", files={"roots": {"peek": {"path": path, "read": True, "write": False}}})
-    with pytest.raises(boring_deploy.Failure, match="profile peek: file root peek .* overlaps"):
+    with pytest.raises(boring_deploy.Failure, match="profile peek: file root peek .* is inside"):
         run_check(host, tmp_path, monkeypatch, {"peek": profile})
 
 
@@ -214,14 +265,16 @@ def switched(host, tmp_path, states):
     for name in ("jo", "mo"):
         (host.config / name).mkdir()
         (host.config / name / "config.json").write_text(json.dumps({
-            "client_uids": [os.getuid()], "socket": f"/run/{name}.sock",
+            "client_uids": [os.getuid()],
             "profiles": {"default": {"active": True}, "spare": {"active": False}}}))
         (host.units / f"boring-pirate@{name}.service").write_text("[Service]\n")
     calls, logged = [], []
 
     def run(*command, user=None, check=True, **options):
         calls.append(command)
-        stdout = states[command[2]] + "\n" if command[:2] == ("systemctl", "is-active") else ""
+        stdout = (states[command[2]] + "\n" if command[:2] == ("systemctl", "is-active")
+                  else "boring-pirate-" + command[-1].removeprefix("boring-pirate@").removesuffix(".service") + "\n" if command[:4] == ("systemctl", "show", "-p", "RuntimeDirectory")
+                  else "")
         return SimpleNamespace(stdout=stdout, stderr="", returncode=0)
     home = tmp_path / "pirates-home"
     new = home / "releases" / "1.1.0"
@@ -243,7 +296,7 @@ def test_the_smoke_pings_only_the_pirates_that_run(host, tmp_path):
     assert context.stopped == ["boring-pirate@jo.service"] and not context.not_started
     assert ("systemctl", "restart", "boring-pirate@mo.service") in calls
     host.steps.smoke(context)
-    assert pings(calls) == ["/run/mo.sock"]
+    assert pings(calls) == ["/run/boring-pirate-mo/pirate.sock"]
     assert "jo: stopped before the update, so not started and not pinged" in logged
     assert any(line.startswith("mo: 1 flavours answer") for line in logged)
 
@@ -273,7 +326,7 @@ def recording_ctx(host, instance, answer=lambda command: "", fails=lambda comman
             return SimpleNamespace(stdout="", stderr="", returncode=1)
         return SimpleNamespace(stdout=answer(command), returncode=0)
     probe = SimpleNamespace(instance=instance, home=host.release.parent / "home", run=run, log=logged.append,
-                            release=SimpleNamespace(directory=host.release), start=[])
+                            release=SimpleNamespace(directory=host.release, version="1.0.0"), start=[])
     return probe, calls, logged
 
 
@@ -396,7 +449,8 @@ def test_a_seal_that_fails_keeps_the_account(host, pirate, tmp_path):
     assert ("userdel", "pirate-mo") in calls and set(pirate.chowned) == {str(pirate.home), str(pirate.state)}
 
 
-def test_install_writes_site_key_and_units(host, tmp_path, monkeypatch):
+@pytest.mark.parametrize("provider,expected_key", [("mistral", "synthetic-key\n"), ("openai_compat", "local\n")])
+def test_install_writes_site_key_and_units(host, tmp_path, monkeypatch, provider, expected_key):
     """install() itself, as the current user: the account and group lookups are faked
     (no root), the Crocodile answers its plan and apply."""
     import pwd
@@ -421,20 +475,47 @@ def test_install_writes_site_key_and_units(host, tmp_path, monkeypatch):
     probe, calls, _ = recording_ctx(host, "mo", crocodile)
     key_file = tmp_path / "key-in"
     key_file.write_text("  synthetic-key\n")
-    host.install.install(probe, {"ponds": "pond", "account": "", "display_name": "", "provider": "mistral",
-                                 "model": "model-z", "key_file": str(key_file), "groups": ""})
+    monkeypatch.setattr(host.install.getpass, "getpass", lambda *a: pytest.fail("unexpected prompt"))
+    chowned = {}  # recorded, not done: the test cannot give a folder to root
+    monkeypatch.setattr(os, "fchown", lambda fd, uid, gid: chowned.__setitem__(
+        Path(os.readlink(f"/proc/self/fd/{fd}")).name.removesuffix(".new"), (uid, gid)))
+    host.install.install(probe, {"ponds": "pond", "account": "", "display_name": "", "provider": provider,
+                                 "endpoint": "http://model.example.test:11434/v1" if provider == "openai_compat" else "",
+                                 "model": "model-z", "key_file": str(key_file) if provider == "mistral" else "", "groups": "",
+                                 "lab": "yes"})
     assert not [c for c in calls if c[0] in ("useradd", "groupadd", "gpasswd")]
+    # The handbook is root's and world-readable (0755/0644); work/ is the Pirate's.
+    assert chowned["handbook"] == chowned["INSTRUCTIONS.md"] == (0, 0)
+    handbook = tmp_path / "home-pirate-mo" / "handbook"
+    assert (handbook.stat().st_mode & 0o777, (handbook / "INSTRUCTIONS.md").stat().st_mode & 0o777) == (0o755, 0o644)
+    assert chowned["work"] == (me.pw_uid, me.pw_gid)
+    record = json.loads((host.config / "mo" / "rendered.json").read_text())
+    assert (record["account"], record["groups"], sorted(record["units"])) == ("pirate-mo", [], sorted(UNITS))
     site_path = host.config / "mo" / "config.json"
     site = json.loads(site_path.read_text())
-    assert (site["provider"], site["profiles"]["default"]["model"]) == ("mistral", "model-z")
+    assert (site["provider"], site["profiles"]["default"]["model"]) == (provider, "model-z")
     assert (site["client_uids"], site["service_authority"]) == ([1001], authority)
     assert site["checkout"] == str(tmp_path / "home-pirate-mo" / "work")
     assert site_path.stat().st_mode & 0o777 == 0o644
-    key = host.config / "mo" / "credentials" / "mistral-api-key"
-    assert key.read_text() == "synthetic-key\n"
+    default, lab = site["profiles"]["default"], site["profiles"]["lab"]
+    assert default["handbook"] == str(tmp_path / "home-pirate-mo" / "handbook" / "INSTRUCTIONS.md")
+    assert "allow_overrides" not in default and "context_files" not in default
+    assert (lab["handbook"], lab["allow_overrides"], lab["model"]) == (None, True, "model-z")
+    assert lab["allowed_tools"] == default["allowed_tools"]
+    assert site["caps"] == {"max_turns": 60, "max_output_tokens": 8192}
+    key = host.config / "mo" / "credentials" / f"{provider}-api-key"
+    assert key.read_text() == expected_key
+    if provider == "openai_compat":
+        assert site["provider_endpoint"] == "http://model.example.test:11434/v1"
+        assert site["profiles"]["default"][provider] == {"max_tokens": 2048, "reasoning_effort": "none"}
+    else:
+        assert "provider_endpoint" not in site
     assert key.stat().st_mode & 0o777 == 0o600
     assert (host.install.STATE / "boring-pirate-mo").stat().st_mode & 0o777 == 0o700
     assert sorted(p.name for p in host.units.iterdir()) == sorted(UNITS)
+    record = json.loads((host.config / "mo" / "rendered.json").read_text())
+    assert record["release"] == "1.0.0" and sorted(record["units"]) == sorted(UNITS)
+    assert all(record["units"][u] == host.pirate_units.digest((host.units / u).read_text()) for u in UNITS)
     for unit in UNITS:
         assert (host.units / unit).stat().st_mode & 0o777 == 0o644
     assert "User=pirate-mo" in (host.units / "boring-pirate@mo.service").read_text()
@@ -505,8 +586,22 @@ def test_root_writes_follow_no_symlink(host, tmp_path):
     assert not target.is_symlink() and target.read_text() == "mine\n" and target.stat().st_mode & 0o777 == 0o640
 
 
-def test_instructions_name_every_tool():
+def test_instructions_name_every_tool_in_prose():
+    # Call syntax in the handbook broke a small model's tool calls (KB #91): name each
+    # tool and say its arguments in words.
     text = (INSTALL / "INSTRUCTIONS.md").read_text()
     for tool in TOOLS:
-        assert f"`{tool}(" in text, tool
-    assert "read_file" not in text and "write_file(" not in text
+        assert f"`{tool}`" in text, tool
+        assert f"{tool}(" not in text, tool
+    assert "read_file" not in text and "write_file" not in text
+    for line in ("FILES:", "CHECKS:", "DOUBTS:"):
+        assert line in text
+
+
+def test_the_exec_unit_cannot_read_the_transcripts(host):
+    """Commands run as the Pirate's UID; its state directory (the transcripts) is
+    hidden from them, as it is from the file tools."""
+    unit = host.install.render(host.release, "boring-pirate-task@.service", {"NAME": "mo", "HOME": "/home/pirate-mo"})
+    assert "InaccessiblePaths=-/var/lib/boring-pirate-mo -/run/credentials\n" in unit
+    assert "ReadWritePaths=/home/pirate-mo/work\n" in unit and "ProtectHome=read-only\n" in unit
+    assert "PrivatePIDs" not in unit.replace("Not PrivatePIDs=", "")  # breaks the runner check (rehearsal)

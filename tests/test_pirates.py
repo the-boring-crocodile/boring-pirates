@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from mistralai.client.models import ChatCompletionResponse
+import httpx
 
 from boring_pirates.common import assignment
 from boring_pirates.common.files import CheckoutFiles
@@ -23,32 +23,78 @@ from boring_pirates.common.history import FileHistory, prune
 from boring_pirates.common.ipc import Pirate, exchange, settings
 from boring_pirates.common.runtime import ToolRuntime
 from boring_worker_kit.outcomes import Refusal
-from boring_pirates.mistral.provider import MistralProvider, Turn
+from boring_pirates.common.providers import Turn
+from boring_pirates.mistral import provider as mistral
+from boring_pirates.mistral.provider import MistralProvider
 
 UID = os.getuid()
 ALL_TOOLS = ["file_list", "file_read", "file_write"]
 
 
-def sdk_response(reason, content="", calls=None):
-    return ChatCompletionResponse.model_validate({
+def mistral_answer(reason, content="", calls=None):
+    """A whole chat completion as Mistral's API returns it."""
+    return {
         "id": "synthetic", "object": "chat.completion", "model": "test-model",
         "created": 1, "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
         "choices": [{"index": 0, "finish_reason": reason, "message": {
             "role": "assistant", "content": content,
             "tool_calls": [{"id": cid, "type": "function", "function": {
                 "name": name, "arguments": args if isinstance(args, str) else json.dumps(args)}} for cid, name, args in (calls or [])]}}],
-    })
+    }
 
 
-class SDKClient:
-    def __init__(self, responses):
-        self.responses = iter(responses)
-        self.requests = []
-        self.chat = self
+def stream_chunks(body):
+    """A whole answer as the chunks Mistral streams: text split over two chunks,
+    tool calls with their index, finish reason and usage in the last chunk."""
+    body = json.loads(json.dumps(body))
+    choice = body["choices"][0]
+    delta = {k: v for k, v in choice["message"].items() if k != "role"}
+    for index, call in enumerate(delta.get("tool_calls") or []):
+        call["index"] = index
+    chunks = []
+    if isinstance(delta.get("content"), str) and len(delta["content"]) > 1:
+        chunks.append({"id": body["id"], "model": body["model"],
+                       "choices": [{"index": 0, "delta": {"content": delta["content"][:1]}, "finish_reason": None}]})
+        delta["content"] = delta["content"][1:]
+    chunks.append({"id": body["id"], "model": body["model"], "usage": body["usage"],
+                   "choices": [{"index": 0, "delta": delta, "finish_reason": choice["finish_reason"]}]})
+    return chunks
 
-    async def complete_async(self, **kwargs):
-        self.requests.append(kwargs)
-        return next(self.responses)
+
+class Events(httpx.AsyncByteStream):
+    """Server-sent events, `pause` seconds before each; `closed` once the client let go."""
+
+    def __init__(self, chunks, pause=0.0):
+        self.chunks, self.pause, self.closed = list(chunks), pause, False
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            await asyncio.sleep(self.pause)
+            yield f"data: {json.dumps(chunk)}\n\n".encode()
+        yield b"data: [DONE]\n\n"
+
+    async def aclose(self):
+        self.closed = True
+
+
+class FakeMistral(httpx.AsyncClient):
+    """Mistral's API over (mocked) HTTP, as the provider's client: each request gets
+    the next answer, streamed (the default) or whole. `requests` keeps the bodies sent."""
+
+    def __init__(self, answers, pause=0.0):
+        self.answers = iter(answers)
+        self.requests, self.streams, self.pause = [], [], pause
+        super().__init__(base_url=mistral.BASE + "/", headers={"Authorization": "Bearer synthetic"},
+                         transport=httpx.MockTransport(self.respond))
+
+    async def respond(self, request):
+        body = json.loads(request.content)
+        self.requests.append(body)
+        answer = next(self.answers)
+        if body.get("stream") is True:
+            self.streams.append(Events(stream_chunks(answer), self.pause))
+            return httpx.Response(200, stream=self.streams[-1], headers={"content-type": "text/event-stream"})
+        return httpx.Response(200, json=answer)
 
 
 def answer(text):
@@ -85,17 +131,17 @@ def make_site(root: Path, profiles=None, **overrides) -> Path:
         (root / name).mkdir(exist_ok=True)
     (root / "history").mkdir(mode=0o700, exist_ok=True)
     (root / "context" / "INSTRUCTIONS.md").write_text("Stay inside checkout.")
-    (root / "context" / "key").write_text("synthetic")
+    for provider in ("mistral", "openai_compat"):  # in $CREDENTIALS_DIRECTORY, as LoadCredential= puts it
+        (root / "context" / f"{provider}-api-key").write_text("synthetic")
     (root / "context" / "descriptor.json").write_text(json.dumps({
         "id": "parrot", "name": "Parrot", "description": "test", "capabilities": [], "workspace_scope": "work"}))
     config = {
-        "provider": "mistral", "socket": str(root / "parrot.sock"), "checkout": str(root / "checkout"),
-        "history_dir": str(root / "history"), "key_file": str(root / "context" / "key"),
+        "provider": "mistral", "checkout": str(root / "checkout"),
         "client_uids": [UID], "descriptor_file": str(root / "context" / "descriptor.json"),
         "default_timeout_seconds": 5, "max_timeout_seconds": 10, "retention_seconds": 60,
         "profiles": profiles if profiles is not None else {
             "alpha": {"active": True, "model": "model-a", "allowed_tools": ALL_TOOLS,
-                      "context_files": [str(root / "context" / "INSTRUCTIONS.md")]},
+                      "handbook": str(root / "context" / "INSTRUCTIONS.md")},
             "beta": {"active": True, "model": "model-b", "max_turns": 2, "allowed_tools": ALL_TOOLS},
             "gamma": {"active": False, "model": "model-c"}},
         **overrides}
@@ -108,14 +154,43 @@ def records(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
+def unit_environment(root: Path) -> dict[str, str]:
+    """The directories systemd names to the Pirate's unit, for a test site at root."""
+    return {"RUNTIME_DIRECTORY": str(root), "STATE_DIRECTORY": str(root / "history"),
+            "CREDENTIALS_DIRECTORY": str(root / "context")}
+
+
 class TempCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         temp = tempfile.TemporaryDirectory(dir="/tmp")  # short paths for Unix sockets
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name)
+        environment = patch.dict(os.environ, unit_environment(self.root))
+        environment.start()
+        self.addCleanup(environment.stop)
 
 
 class ConfigTest(TempCase):
+    async def test_check_config_reads_what_serve_reads(self):
+        from boring_pirates.common.ipc import check_config
+        path = make_site(self.root)
+        report = check_config(path)
+        self.assertEqual((report["ok"], report["uid"], report["credential"]), (True, UID, "present"))
+        self.assertEqual(sorted(report["flavours"]), ["alpha", "beta"])
+        self.assertEqual(report["inactive"], ["gamma"])
+        self.assertEqual(report["flavours"]["alpha"]["context"][0]["path"], str(self.root / "context" / "INSTRUCTIONS.md"))
+        (self.root / "context" / "mistral-api-key").unlink()
+        self.assertEqual(check_config(path)["credential"], "absent here (only inside the unit)")
+        (self.root / "context" / "INSTRUCTIONS.md").unlink()  # a context file gone: serve would fail too
+        with self.assertRaises(OSError):
+            check_config(path)
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "boring_pirates.common.ipc", "check-config", "--config", str(path),
+            stdout=asyncio.subprocess.PIPE)
+        out, _ = await process.communicate()
+        self.assertEqual(process.returncode, 1)
+        self.assertFalse(json.loads(out)["ok"])
+
     async def test_flavours_are_active_profiles(self):
         config = settings(make_site(self.root))
         self.assertEqual({n for n, s in config.profiles.items() if s.active}, {"alpha", "beta"})
@@ -131,6 +206,9 @@ class ConfigTest(TempCase):
             ({"max_stored_assignments": 5}, None, "unexpected \\['max_stored_assignments'\\]"),
             ({}, {"alpha": {"model": "m"}}, '"active" must be true or false'),
             ({}, {"alpha": {"active": "yes", "model": "m"}}, '"active" must be true or false'),
+            ({}, {"alpha": {"active": True, "model": "m", "max_service_calls": 0}}, "max_service_calls must be a positive integer"),
+            ({}, {"alpha": {"active": True, "model": "m", "write_reminder_after": "5"}}, "write_reminder_after must be a positive integer"),
+            ({}, {"alpha": {"active": True, "model": "m", "digest_file": 5}}, "invalid digest_file"),
             ({}, {"Alpha": good}, "must match"),
             ({}, {"-alpha": good}, "must match"),
             ({}, {"a" * 64: good}, "must match"),
@@ -172,25 +250,71 @@ class ConfigTest(TempCase):
         def site(path):
             return make_site(self.root, {"alpha": {"active": True, "model": "m", "files": {
                 "roots": {"work": {"path": str(path), "read": True, "write": False}}}}})
-        make_site(self.root)  # the key lives in context/, transcripts in history/
-        state = self.root / "state"
-        for name in ("context/inner", "history/inner", "state", "shared", "history-notes"):
+        make_site(self.root)  # the key lives in context/, transcripts in history/ (the state directory)
+        for name in ("context/inner", "history/inner", "shared", "history-notes"):
             (self.root / name).mkdir()
         (self.root / "shared" / "to-history").symlink_to(self.root / "history")
-        refused = [self.root / "context", self.root / "context" / "inner", self.root / "history",
-                   self.root / "history" / "inner", self.root, state, state / "later",
-                   self.root / "shared" / "to-history", Path("/run/credentials/boring-pirate@mo.service"),
-                   Path("/run"), Path("/")]
-        with patch.dict(os.environ, {"STATE_DIRECTORY": str(state)}):
-            for path in refused:
-                with self.subTest(path=path), self.assertRaisesRegex(ValueError, "file root work .* overlaps"):
-                    settings(site(path))
-            for path in (self.root / "checkout", self.root / "shared", self.root / "history-notes"):
-                with self.subTest(path=path):
-                    self.assertEqual(settings(site(path)).profiles["alpha"].files.roots["work"].path, path)
-            # the default root (work at the workdir) passes the same check
-            self.assertEqual(settings(make_site(self.root)).profiles["beta"].files.roots["work"].path,
-                             (self.root / "checkout").resolve())
+        inside = [self.root / "context", self.root / "context" / "inner", self.root / "history",
+                  self.root / "history" / "inner",
+                  self.root / "shared" / "to-history", Path("/run/credentials/boring-pirate@mo.service"),
+                  Path("/proc"), Path("/proc/self"), Path("/sys/kernel"), Path("/dev")]
+        for path in inside:
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, "file root work .* is inside"):
+                settings(site(path))
+        for path in (self.root / "checkout", self.root / "shared", self.root / "history-notes"):
+            with self.subTest(path=path):
+                root = settings(site(path)).profiles["alpha"].files.roots["work"]
+                self.assertEqual((root.path, root.deny), (path, ()))
+        # A root containing protected directories gets them denied (PF1), not refused.
+        relative = self.root.relative_to("/").parts
+        for path, denied in ((self.root, {("context",), ("history",)}),
+                             (Path("/run"), {("credentials",)}),
+                             (Path("/"), {("run", "credentials"), ("proc",), ("sys",), ("dev",),
+                                          (*relative, "context"), (*relative, "history")})):
+            with self.subTest(path=path):
+                root = settings(site(path)).profiles["alpha"].files.roots["work"]
+                self.assertEqual(set(root.deny), denied)
+        # the default root (work at the workdir) passes the same check
+        self.assertEqual(settings(make_site(self.root)).profiles["beta"].files.roots["work"].path,
+                         (self.root / "checkout").resolve())
+
+    async def test_the_unit_names_the_socket_state_and_key(self):
+        config = settings(make_site(self.root))
+        self.assertEqual((config.socket, config.history_dir, config.key_file),
+                         (self.root / "pirate.sock", self.root / "history", self.root / "context" / "mistral-api-key"))
+        for key in ("socket", "history_dir", "key_file"):  # config.json no longer repeats them
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, f"unexpected \\['{key}'\\]"):
+                settings(make_site(self.root, **{key: "/somewhere"}))
+        for variable in ("RUNTIME_DIRECTORY", "STATE_DIRECTORY", "CREDENTIALS_DIRECTORY"):
+            for value in ("", "relative", "/a:/b"):
+                with self.subTest(variable=variable, value=value), \
+                        self.assertRaisesRegex(ValueError, f"\\${variable} must name one directory"):
+                    settings(make_site(self.root), environment={**unit_environment(self.root), variable: value})
+        outside = {k: v for k, v in unit_environment(self.root).items() if k != "CREDENTIALS_DIRECTORY"}
+        self.assertIsNone(settings(make_site(self.root), environment=outside, credential_loaded=False).key_file)
+
+    async def test_protected_directories_stay_out_of_reach_through_the_file_tools(self):
+        """A root of / reads ordinary files but not the key, the history, nor the
+        Pirate process's own memory and environment under /proc/<pid>/."""
+        policy = settings(make_site(self.root, {"alpha": {"active": True, "model": "m", "files": {
+            "roots": {"fs": {"path": "/", "read": True, "write": False}}}}})).profiles["alpha"]
+        files = CheckoutFiles(self.root / "checkout", policy.files, self.root / "checkout")
+        self.addCleanup(files.close)
+
+        async def call(name, **args):
+            deadline = asyncio.get_running_loop().time() + 5
+            return await ToolRuntime().dispatch(files, None, {"id": "t", "name": name,
+                                                              "arguments": {"root": "fs", **args}}, deadline)
+        relative = str(self.root.relative_to("/"))
+        (self.root / "checkout" / "note.txt").write_text("hello")
+        self.assertEqual((await call("file_read", path=relative + "/checkout/note.txt"))["content"], "hello")
+        pid = os.getpid()
+        for name, path in (("file_read", relative + "/context/key"), ("file_list", relative + "/history"),
+                           ("file_read_bytes", f"proc/{pid}/mem"), ("file_read", f"proc/{pid}/environ"),
+                           ("file_list", "run/credentials"), ("file_list", "sys/kernel"), ("file_read", "dev/null")):
+            with self.subTest(path=path), self.assertRaises(Refusal) as refused:
+                await call(name, path=path)
+            self.assertEqual(refused.exception.code, "forbidden")
 
     async def test_the_transcript_names_the_flavours_provider(self):
         import dataclasses
@@ -383,7 +507,7 @@ class RegistrationTest(SocketCase):
         self.parrot.scan()
         await self.eventually(lambda: len(received) == 2)
         self.assertEqual(sorted(received, key=lambda m: m["flavour"]), [
-            {"operation": "register", "kind": "pirate", "flavour": f, "socket_path": str(self.root / "parrot.sock")}
+            {"operation": "register", "kind": "pirate", "flavour": f, "socket_path": str(self.root / "pirate.sock")}
             for f in ("alpha", "beta")])
         owner, watchdogs, _ = self.parrot.ponds[str(path)]
         self.assertEqual((owner, sorted(watchdogs)), (UID, ["alpha", "beta"]))
@@ -477,14 +601,14 @@ class AssignmentTest(TempCase):
         self.assertEqual(last["kind"], "outcome")
         return last["data"]["state"], last["data"]["reason"]
 
-    async def test_sdk_edit_journey(self):
+    async def test_mistral_edit_journey(self):
         (self.root / "checkout" / "note.txt").write_text("initial")
         initial = hashlib.sha256(b"initial").hexdigest()
-        client = SDKClient([
-            sdk_response("tool_calls", calls=[("a", "file_read", {"root": "work", "path": "note.txt"}),
+        client = FakeMistral([
+            mistral_answer("tool_calls", calls=[("a", "file_read", {"root": "work", "path": "note.txt"}),
                                               ("b", "file_write", {"root": "work", "path": "note.txt", "content": "edited",
                                                                    "expected_sha256": initial})]),
-            sdk_response("stop", "Done.")])
+            mistral_answer("stop", "Done.")])
         result = await self.run_with(MistralProvider("model-a", client))
         self.assertEqual((result["state"], result["answer"]), ("completed", "Done."))
         self.assertEqual((result["usage"]["model_calls"], result["usage"]["input_tokens"],
@@ -543,6 +667,11 @@ class AssignmentTest(TempCase):
         self.assertEqual([r["ok"] for r in tool_results], [False, False, True, True])
         self.assertIn("stale edit: expected hash differs", tool_results[0]["error"])
         self.assertIn("stale edit: file is absent", tool_results[1]["error"])
+        # The model is told the next step, with the current hash it already gets in the refusal.
+        self.assertIn("Read it with file_read first", tool_results[0]["hint"])
+        self.assertIn(hashlib.sha256(b"old").hexdigest(), tool_results[0]["hint"])
+        self.assertIn("expected_sha256 null", tool_results[1]["hint"])
+        self.assertNotIn("hint", tool_results[2])
         self.assertEqual(result["write_actions_count"], 2)
         self.assertEqual(result["tool_errors_count"], 2)
         self.assertEqual(result["tool_errors"], [{"tool": "file_write", "error": e["error"]} for e in tool_results[:2]])
@@ -570,11 +699,11 @@ class AssignmentTest(TempCase):
         self.assertEqual((self.root / "checkout" / "new.txt").read_text(), "x")
 
     async def test_malformed_tool_calls_go_back_to_the_model(self):
-        client = SDKClient([
-            sdk_response("tool_calls", calls=[("a", "file_write", '{"root": "work", "path": "x.txt", "content": '),
+        client = FakeMistral([
+            mistral_answer("tool_calls", calls=[("a", "file_write", '{"root": "work", "path": "x.txt", "content": '),
                                               ("b", "", {"path": "."}),
                                               ("c", "file_list", "[1]")]),
-            sdk_response("stop", "Retried.")])
+            mistral_answer("stop", "Retried.")])
         result = await self.run_with(MistralProvider("model-a", client))
         self.assertEqual((result["state"], result["answer"], result["usage"]["tool_calls"]),
                          ("completed", "Retried.", 3))
@@ -586,15 +715,15 @@ class AssignmentTest(TempCase):
                                       "ValueError: tool arguments must be a JSON object"])
         self.assertFalse((self.root / "checkout" / "x.txt").exists())
         # A response whose finish reason disagrees with its calls is still broken: a failure.
-        broken = SDKClient([sdk_response("stop", calls=[("d", "file_list", {"root": "work", "path": "."})])])
-        with self.assertRaisesRegex(ValueError, "finish reason disagrees"):
-            await self.run_with(MistralProvider("model-a", broken))
+        broken = FakeMistral([mistral_answer("stop", calls=[("d", "file_list", {"root": "work", "path": "."})])])
+        result = await self.run_with(MistralProvider("model-a", broken))
+        self.assertEqual((result["state"], result["reason"]), ("failed", "provider_invalid_response"))
 
     async def test_sampling_settings_cache_key_and_structured_content(self):
         thinking = [{"type": "thinking", "thinking": [{"type": "text", "text": "hmm"}]},
                     {"type": "text", "text": "Done"}, {"type": "text", "text": "."}]
-        client = SDKClient([sdk_response("tool_calls", calls=[("a", "file_list", {"root": "work", "path": "."})]),
-                            sdk_response("stop", thinking)])
+        client = FakeMistral([mistral_answer("tool_calls", calls=[("a", "file_list", {"root": "work", "path": "."})]),
+                            mistral_answer("stop", thinking)])
         provider = MistralProvider("model-a", client, options={"temperature": 0.05, "reasoning_effort": "low"})
         result = await self.run_with(provider)
         self.assertEqual((result["state"], result["answer"]), ("completed", "Done."))
@@ -602,13 +731,14 @@ class AssignmentTest(TempCase):
         self.assertEqual((first["temperature"], first["reasoning_effort"]), (0.05, "low"))
         self.assertRegex(first["prompt_cache_key"], r"^[0-9a-f]{32}$")
         self.assertEqual(first["prompt_cache_key"], second["prompt_cache_key"])  # one key per run
-        plain = SDKClient([sdk_response("stop", "ok")])
+        plain = FakeMistral([mistral_answer("stop", "ok")])
         await self.run_with(MistralProvider("model-a", plain))
         self.assertNotIn("temperature", plain.requests[0])
         self.assertNotIn("reasoning_effort", plain.requests[0])
-        odd = SDKClient([sdk_response("stop", [{"type": "image_url", "image_url": "https://x"}])])
-        with self.assertRaisesRegex(ValueError, "unsupported completion part 'image_url'"):
-            await self.run_with(MistralProvider("model-a", odd))
+        odd = FakeMistral([mistral_answer("stop", [{"type": "image_url", "image_url": "https://x"}])])
+        result = await self.run_with(MistralProvider("model-a", odd))
+        self.assertEqual((result["state"], result["reason"]), ("failed", "provider_invalid_response"))
+        self.assertIn("unsupported completion part 'image_url'", json.dumps(self.trail()))
 
     async def test_tool_errors_are_capped_in_the_result(self):
         bad = [tool_call(str(i), "file_read", root="work", path="absent-%d.txt" % i) for i in range(34)]
@@ -623,13 +753,88 @@ class AssignmentTest(TempCase):
         self.assertEqual(result["tool_errors"], [{"tool": "y" * 64, "error": unknown[:assignment.MAX_TOOL_ERROR_TEXT]}])
         self.assertEqual((await self.run_with(Script(answer("ok"))))["tool_errors"], [])
 
+    async def test_an_empty_turn_is_asked_again_a_bounded_number_of_times(self):
+        # A server that drops an unparsable tool call returns neither text nor calls.
+        seen = []
+        class Recorder(Script):
+            async def complete(self, messages):
+                seen.append(len(messages))
+                return await super().complete(messages)
+        result = await self.run_with(Recorder(answer(""), answer(" "), answer("Done.")), max_turns=5)
+        self.assertEqual((result["state"], result["answer"], result["usage"]["empty_turn_retries"]),
+                         ("completed", "Done.", 2))
+        self.assertEqual(len(set(seen)), 1)  # the empty turns are not kept in the conversation
+        self.assertEqual([r["data"] for r in self.trail() if r["kind"] == "empty_turn"], [{"retry": 1}, {"retry": 2}])
+        empties = [answer("") for _ in range(assignment.EMPTY_TURN_RETRIES + 1)]
+        result = await self.run_with(Script(*empties), max_turns=10)
+        self.assertEqual((result["state"], result["answer"], result["usage"]["empty_turn_retries"]),
+                         ("completed", "", assignment.EMPTY_TURN_RETRIES))
+
+    async def test_service_call_budget_and_write_reminder(self):
+        calls = [tool_call(str(i), "service_call", service="knowledge", tool="kb_search", arguments={}) for i in range(2)]
+        result = await self.run_with(Script(*calls, answer("ok")), max_turns=5,
+                                     tools=frozenset(ALL_TOOLS) | {"service_call"}, max_service_calls=1)
+        self.assertEqual(result["usage"]["service_calls"], 1)
+        self.assertIn("service_call budget of 1", result["tool_errors"][-1]["error"])
+        seen = []
+        class Recorder(Script):
+            async def complete(self, messages):
+                seen.append([m.get("content") for m in messages if m.get("role") == "user"])
+                return await super().complete(messages)
+        lists = [tool_call(str(i), "file_list", root="work", path=".") for i in range(3)]
+        result = await self.run_with(Recorder(*lists, answer("ok")), max_turns=6, write_reminder_after=2)
+        self.assertEqual(result["usage"]["write_reminders"], 1)
+        self.assertEqual([len(users) for users in seen], [1, 1, 2, 2])  # once, after the second call
+        self.assertIn("written no file", seen[2][-1])
+        self.assertEqual([r["data"] for r in self.trail() if r["kind"] == "write_reminder"], [{"tool_calls": 2}])
+
+    async def test_digest_ends_every_call_inside_the_last_message(self):
+        digest = self.root / "digest.md"
+        digest.write_text("Conditions go into the where clause.\n")
+        seen = []
+        class Recorder(Script):
+            async def complete(self, messages):
+                seen.append([dict(m) for m in messages])
+                return await super().complete(messages)
+        lists = [tool_call(str(i), "file_list", root="work", path=".") for i in range(2)]
+        result = await self.run_with(Recorder(*lists, answer("ok")), max_turns=5, digest_file=digest)
+        self.assertEqual(result["usage"]["digest_calls"], 3)
+        # First call: at the end of the prompt, so a one-shot answer sees it too.
+        self.assertEqual([m["role"] for m in seen[0]], ["system", "user"])
+        self.assertTrue(seen[0][1]["content"].startswith("Do it\n\n---\nKey rules"))
+        for sent in seen[1:]:  # later: at the end of the latest tool result, never a user turn of its own
+            self.assertEqual(sent[-1]["role"], "tool")
+            self.assertTrue(sent[-1]["content"].endswith("Conditions go into the where clause."))
+            self.assertEqual(sent[1]["content"], "Do it")  # earlier copies are not kept
+        self.assertEqual(len(seen[2]), len(seen[1]) + 2)  # +1 turn, +1 tool result
+        self.assertEqual(sum("where clause" in json.dumps(m) for m in seen[2]), 1)
+        history = json.dumps(self.trail())
+        self.assertNotIn("where clause", history)  # the transcript keeps the conversation without it
+        # After an image (list content) the digest is a text part of that message, not a turn of its own.
+        image = [{"role": "user", "content": [{"type": "image_url", "image_url": "data:"}]}]
+        sent = assignment.with_digest(image, "R")
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["content"][-1], {"type": "text", "text": assignment.DIGEST.format(digest="R").lstrip()})
+        self.assertEqual(len(image[0]["content"]), 1)  # the conversation itself is not changed
+        digest.write_bytes(b"x" * 5000)
+        with self.assertRaisesRegex(ValueError, "digest file exceeds limit"):
+            await self.run_with(Script(answer("ok")), digest_file=digest)
+
+    async def test_the_result_checks_the_answers_files_line(self):
+        script = Script(tool_call("1", "file_write", root="work", path="a.txt", content="a", expected_sha256=None),
+                        answer("Wrote them.\nFILES: a.txt, b.txt"))
+        result = await self.run_with(script)
+        self.assertEqual(result["files_check"], {"claimed": ["a.txt", "b.txt"], "claimed_not_written": ["b.txt"],
+                                                 "written_not_claimed": []})
+        self.assertNotIn("files_check", await self.run_with(Script(answer("ok"))))
+
     async def test_model_failures_are_outcomes(self):
         loop = [tool_call(str(i), "file_list", root="work", path=".") for i in range(3)]
         result = await self.run_with(Script(*loop), max_turns=2)
         self.assertEqual((result["state"], result["reason"], result["answer"]), ("incomplete", "turn_limit", None))
         self.assertEqual(result["usage"]["model_calls"], 2)
         self.assertEqual(self.trail()[-1]["data"], {"state": "incomplete", "reason": "turn_limit"})
-        truncated = MistralProvider("model-a", SDKClient([sdk_response("length", "partial")]))
+        truncated = MistralProvider("model-a", FakeMistral([mistral_answer("length", "partial")]))
         result = await self.run_with(truncated)
         self.assertEqual((result["state"], result["reason"], result["usage"]["finish_reason"]),
                          ("incomplete", "truncated", "length"))
@@ -688,21 +893,27 @@ class AssignmentTest(TempCase):
         history.close()
         self.assertFalse((self.root / "checkout" / "f.txt").exists())
 
-    async def test_real_sdk_http_serialization(self):
-        import httpx
-        from mistralai.client import Mistral
-        requests = []
+    async def test_mistral_http_request(self):
+        seen = []
 
         def respond(request):
-            requests.append(json.loads(request.content))
-            return httpx.Response(200, json=sdk_response("stop", "ok").model_dump(mode="json"))
-        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as transport:
-            provider = MistralProvider("test-model", Mistral(api_key="synthetic", async_client=transport),
-                                       options={"max_tokens": 4096}, allowed_tools=frozenset({"file_read"}))
+            seen.append(request)
+            events = "".join(f"data: {json.dumps(c)}\n\n" for c in stream_chunks(mistral_answer("stop", "ok")))
+            return httpx.Response(200, content=(events + "data: [DONE]\n\n").encode(),
+                                  headers={"content-type": "text/event-stream"})
+        async with mistral.client("synthetic", 5, transport=httpx.MockTransport(respond)) as client:
+            provider = MistralProvider("test-model", client, options={"max_tokens": 4096},
+                                       allowed_tools=frozenset({"file_read"}))
             turn = await provider.complete([{"role": "user", "content": "check"}])
         self.assertEqual(turn.text, "ok")
-        self.assertEqual([t["function"]["name"] for t in requests[0]["tools"]], ["file_read"])
-        self.assertEqual((requests[0]["max_tokens"], requests[0]["parallel_tool_calls"]), (4096, True))
+        request = seen[0]
+        self.assertEqual((str(request.url), request.headers["authorization"], request.headers["accept"]),
+                         ("https://api.mistral.ai/v1/chat/completions", "Bearer synthetic", "text/event-stream"))
+        body = json.loads(request.content)
+        self.assertEqual([t["function"]["name"] for t in body["tools"]], ["file_read"])
+        self.assertEqual((body["max_tokens"], body["parallel_tool_calls"], body["stream"], body["tool_choice"]),
+                         (4096, True, True, "auto"))
+        self.assertNotIn("stream_options", body)
 
 
 class TranscriptTest(unittest.TestCase):

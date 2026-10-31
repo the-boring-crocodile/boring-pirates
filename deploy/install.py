@@ -19,7 +19,9 @@ the one code HOME (/opt/boring-pirates). What install makes for NAME:
                 operator's from then on (more flavours and the provider's block go there)
     units       boring-pirate-task-NAME.socket, boring-pirate-task-NAME@.service,
                 system-pirateNAME.slice, then boring-pirate@NAME.service last
-                (with its config, what makes look say "installed")
+                (with its config, what makes look say "installed"); rendered.json
+                beside config.json records the account, the groups and the units
+                (a later deploy renders them again, deploy.d/pirate_units.py)
 
 Uninstall NAME: its units and its task slice stop, and nothing is removed
 unless they are then inactive; the Crocodile takes it out (pirate-remove); with
@@ -38,25 +40,31 @@ import pwd
 import sys
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 from boring_install import Failure, Look, Setting, seal
 
+import pirate_units
 import steps
+from pirate_units import ACCOUNT_PATTERN, GROUP_PATTERN, NAME_PATTERN, PROVIDERS, render, write as _write
 
 INSTANCE = Setting("name", "the Pirate's name: lowercase letters and digits, from a letter",
-                   pattern=r"[a-z][a-z0-9]{0,15}")
-PROVIDERS = ("mistral",)
+                   pattern=NAME_PATTERN)
 SETTINGS = [
     Setting("ponds", "the Ponds it serves: all, or names with commas", pattern=r"[a-z0-9,-]+"),
-    Setting("account", "its Unix account (empty: pirate-NAME)", default="", pattern=r"([a-z_][a-z0-9_-]{0,31})?"),
+    Setting("account", "its Unix account (empty: pirate-NAME)", default="", pattern=f"({ACCOUNT_PATTERN})?"),
     Setting("display-name", "the name it introduces itself with (empty: NAME)", default="",
             pattern=r"[^\n@\"\\]{0,60}"),
     Setting("provider", "the model API: " + ", ".join(PROVIDERS), default="mistral", pattern="|".join(PROVIDERS)),
     Setting("model", "the model of its default flavour", default="mistral-small-2603", pattern=r"[A-Za-z0-9._:-]+"),
+    Setting("endpoint", "OpenAI-compatible API base URL (required for openai_compat; empty for mistral)", default=""),
     Setting("key-file", "a file with the provider's API key (empty: typed at the terminal)", default=""),
     Setting("groups", "existing groups it also gets, with commas (empty: none)", default="",
-            pattern=r"([a-z_][a-z0-9_-]*(,[a-z_][a-z0-9_-]*)*)?"),
+            pattern=f"({GROUP_PATTERN}(,{GROUP_PATTERN})*)?"),
+    Setting("lab", "also a flavour lab that takes per-call overrides: yes or no", default="no", pattern="yes|no"),
 ]
+CAPS = {"max_turns": 60, "max_output_tokens": 8192}  # upper bounds for overrides (the code's defaults too)
 CLIENTS = "pirate-clients"
 CROCODILE = Path("/opt/boring-crocodile/current/bin/boring-crocodile-admin")
 CROCODILE_CONFIG = Path("/etc/boring-crocodile/config.toml")
@@ -141,6 +149,7 @@ def look(ctx):
 
 
 def ready(ctx, settings):
+    provider_endpoint(settings["provider"], settings.get("endpoint"))
     name = ctx.instance
     account = _account(ctx, settings)
     if not os.access(CROCODILE, os.X_OK):
@@ -167,7 +176,7 @@ def ready(ctx, settings):
     key = _paths(name)["credentials"] / f"{settings['provider']}-api-key"
     if settings["key_file"] and not Path(settings["key_file"]).is_file():
         raise Failure(f"--key-file: {settings['key_file']} is not a file")
-    if not settings["key_file"] and not key.exists() and not sys.stdin.isatty():
+    if settings["provider"] == "mistral" and not settings["key_file"] and not key.exists() and not sys.stdin.isatty():
         raise Failure("the API key: --key-file, or a terminal to type it at")
     _refuse_links_in(_home(account))
 
@@ -179,6 +188,7 @@ def _unit_user(ctx, pirate):
 # -- install -----------------------------------------------------------------
 
 def plan(ctx, settings):
+    endpoint = provider_endpoint(settings["provider"], settings.get("endpoint"))
     name, account = ctx.instance, _account(ctx, settings)
     paths = _paths(name)
     lines = [] if _user(account) else [f"create the system account {account} (own group, nologin, "
@@ -186,37 +196,18 @@ def plan(ctx, settings):
     lines += [f"{CLIENTS}: {account} joins (the group is created if missing)",
               f"{paths['state']} ({account}'s, 0700)",
               f"the {settings['provider']} key in {paths['credentials']} "
-              + ("from " + settings["key_file"] if settings["key_file"] else "(kept if there, else typed now)"),
+              + ("from " + settings["key_file"] if settings["key_file"] else
+                 "(kept if there, else local placeholder)" if settings["provider"] == "openai_compat" else
+                 "(kept if there, else typed now)"),
               f"the Pond: boring-crocodile-admin pirate-add {name} --account {account} --ponds {settings['ponds']}"
               " (restarts the controller and any worker that joins pirate-clients)",
               f"{paths['file']}: flavour default, {settings['provider']} {settings['model']}",
               f"units {paths['socket']}, {paths['task']}, {paths['slice']}, {paths['unit']}"
               + (f" (also in groups {settings['groups']})" if settings["groups"] else ""),
               "then the deploy: every Pirate here restarts and answers its pings"]
+    if endpoint is not None:
+        lines.append(f"provider endpoint: {endpoint} (network access control is deployment-owned)")
     return lines
-
-
-def _write(path, text, mode, owner=None):
-    """Replace path with text, following no symlink: its directory and the new file
-    are opened with O_NOFOLLOW, mode and owner are set on the open file, and the
-    rename happens inside that directory (a link at path is replaced, not followed)."""
-    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    try:
-        temporary = path.name + ".new"
-        try:
-            os.unlink(temporary, dir_fd=directory)  # a leftover of an interrupted write (a link: the link)
-        except FileNotFoundError:
-            pass
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600,
-                     dir_fd=directory)
-        with os.fdopen(fd, "w") as stream:
-            stream.write(text)
-            os.fchmod(fd, mode)
-            if owner is not None:
-                os.fchown(fd, owner.pw_uid, owner.pw_gid)
-        os.replace(temporary, path.name, src_dir_fd=directory, dst_dir_fd=directory)
-    finally:
-        os.close(directory)
 
 
 def _directory(path, owner, mode):
@@ -236,30 +227,49 @@ def _directory(path, owner, mode):
         os.close(fd)
 
 
-def render(directory, name, values):
-    """A template from the release's install/ folder, @KEY@ filled in."""
-    text = (Path(directory) / "install" / name).read_text()
-    for key, value in values.items():
-        text = text.replace(f"@{key}@", value)
-    return text
-
-
 def _template(ctx, name, values):
     return render(ctx.release.directory, name, values)
 
 
-def site_document(directory, *, name, home, state, provider, model, client_uids, authority):
-    """The Pirate's config.json: provider at the top, one flavour (default) from the
-    release's profile.json with the provider's default settings."""
+def provider_endpoint(provider, value):
+    """Validate installer input before host effects; runtime is not installed yet."""
+    if provider == "mistral":
+        if value not in (None, ""):
+            raise Failure("mistral uses its own API; --endpoint is not accepted")
+        return None
+    if provider != "openai_compat":
+        raise Failure("unknown provider")
+    if not isinstance(value, str) or not value or any(c.isspace() or ord(c) < 32 for c in value):
+        raise Failure("--endpoint: an HTTP(S) base URL is required for openai_compat")
+    try:
+        parsed = urlsplit(value)
+        _ = parsed.port  # Parsing the hostname alone does not validate the port.
+        if (parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username is not None
+                or parsed.password is not None or parsed.query or parsed.fragment):
+            raise ValueError("invalid base URL")
+    except ValueError:
+        raise Failure("--endpoint: HTTP(S) base URL, no credentials, query or fragment") from None
+    return value.rstrip("/")
+
+
+def site_document(directory, *, name, home, provider, model, client_uids, authority, endpoint=None,
+                  lab=False):
+    """The Pirate's config.json: provider at the top, one fixed flavour (default) from
+    the release's profile.json with the provider's default settings and its handbook;
+    with `lab`, a flavour lab as well: the same model and tools, no handbook, and
+    per-call overrides allowed (within the Pirate's caps)."""
+    endpoint = provider_endpoint(provider, endpoint)
     home, paths = Path(home), _paths(name)
     profile = json.loads((Path(directory) / "install" / "profile.json").read_text())
-    profile.update(model=model, context_files=[str(home / "handbook" / "INSTRUCTIONS.md")])
-    return {
+    profile.update(model=model, handbook=str(home / "handbook" / "INSTRUCTIONS.md"))
+    if provider == "openai_compat":
+        profile[provider] = {"max_tokens": 2048, "reasoning_effort": "none"}
+    profiles = {"default": profile}
+    if lab:
+        profiles["lab"] = {**profile, "handbook": None, "allow_overrides": True}
+    document = {
         "provider": provider,
-        "socket": f"/run/boring-pirate-{name}/pirate.sock",
         "checkout": str(home / "work"),
-        "history_dir": str(state),
-        "key_file": f"/run/credentials/{paths['unit']}/{provider}-api-key",
         "client_uids": client_uids,
         "descriptor_file": str(home / "handbook" / "descriptor.json"),
         "default_timeout_seconds": 120, "max_timeout_seconds": 600, "retention_seconds": 604800,
@@ -269,8 +279,12 @@ def site_document(directory, *, name, home, state, provider, model, client_uids,
                       "task_unit_prefix": f"boring-pirate-task-{name}",
                       "task_cgroup_parent": f"/system.slice/{paths['slice']}", "output_limit_bytes": 65536},
         "service_authority": authority,
-        "profiles": {"default": profile},
+        "caps": dict(CAPS),
+        "profiles": profiles,
     }
+    if endpoint is not None:
+        document["provider_endpoint"] = endpoint
+    return document
 
 
 def _admit(ctx, name, account, ponds):
@@ -286,6 +300,7 @@ def _admit(ctx, name, account, ponds):
 
 
 def install(ctx, settings):
+    endpoint = provider_endpoint(settings["provider"], settings.get("endpoint"))
     name, account = ctx.instance, _account(ctx, settings)
     paths = _paths(name)
     _refuse_links_in(_home(account))  # again, just before the first change
@@ -311,16 +326,23 @@ def install(ctx, settings):
     display = settings["display_name"] or name
     values = {"NAME": name, "ACCOUNT": account, "DISPLAY": display, "HOME": str(home), "CODE": str(ctx.home),
               "PROVIDER": settings["provider"], "GROUPS": settings["groups"].replace(",", " ")}
-    for directory in (home / "work", home / "handbook"):
-        _directory(directory, user, 0o750)
+    _directory(home / "work", user, 0o750)
+    # A new handbook is root's and world-readable (the home, 0750, keeps others out;
+    # the units run with Group=pirate-clients, not the account's own group): a fixed
+    # flavour's rules cannot be changed by the Pirate's UID, whose units' sandbox
+    # also keeps all but work/ read-only. An existing handbook folder is left as it is.
+    keeper = SimpleNamespace(pw_uid=0, pw_gid=0)
+    if not os.path.lexists(home / "handbook"):
+        _directory(home / "handbook", keeper, 0o755)
     for document in HANDBOOK:
         if not os.path.lexists(home / "handbook" / document):
-            _write(home / "handbook" / document, _template(ctx, document, values), 0o640, user)
+            _write(home / "handbook" / document, _template(ctx, document, values), 0o644, keeper)
     _directory(paths["state"], user, 0o700)
     paths["credentials"].mkdir(mode=0o700, parents=True, exist_ok=True)
     key = paths["credentials"] / f"{settings['provider']}-api-key"
     if not key.exists():
         secret = (Path(settings["key_file"]).read_text() if settings["key_file"]
+                  else "local" if settings["provider"] == "openai_compat"
                   else getpass.getpass(f"  {settings['provider']} API key for {name} (not shown): "))
         if not secret.strip():
             raise Failure("no API key given")
@@ -335,19 +357,27 @@ def install(ctx, settings):
         ctx.log(f"the Pond admits {name} already")
     else:
         pond = _admit(ctx, name, account, settings["ponds"])
-        site = site_document(ctx.release.directory, name=name, home=home, state=paths["state"],
+        site = site_document(ctx.release.directory, name=name, home=home,
                              provider=settings["provider"], model=settings["model"],
-                             client_uids=pond["client_uids"], authority=pond["service_authority"])
+                             client_uids=pond["client_uids"], authority=pond["service_authority"], endpoint=endpoint,
+                             lab=settings.get("lab") == "yes")
         _write(paths["file"], json.dumps(site, indent=2) + "\n", 0o644)
         ctx.log(f"wrote {paths['file']} (yours from now on: more flavours go there)")
-    for template, unit in (("boring-pirate-task.socket", paths["socket"]),
-                           ("boring-pirate-task@.service", paths["task"]),
-                           ("system-pirate.slice", paths["slice"]),
-                           ("boring-pirate@.service", paths["unit"])):  # the Pirate's own unit last
-        _write(steps.UNITS_DIR / unit, _template(ctx, template, values), 0o644)
+    # The account and groups first (the deploy renders the units from them), with no
+    # unit named yet; the units' hashes last, so a failure in between leaves them
+    # unrecorded and the deploy finishes the reload, the socket restart and the record.
+    groups = [g for g in settings["groups"].split(",") if g]
+    pirate_units.write_record(name, {}, ctx.release.version, account, groups)
+    written = {}
+    for template, unit in pirate_units.unit_files(name):  # the Pirate's own unit last
+        written[unit] = _template(ctx, template, values)
+        _write(steps.UNITS_DIR / unit, written[unit], 0o644)
     ctx.run("systemctl", "daemon-reload")
     ctx.run("systemctl", "enable", "--now", paths["socket"])
     ctx.run("systemctl", "enable", paths["unit"])
+    # What a later deploy may replace (it renders the units again with its templates).
+    pirate_units.write_record(name, {unit: pirate_units.digest(text) for unit, text in written.items()},
+                              ctx.release.version, account, groups)
     ctx.start.append(paths["unit"])  # an update leaves a stopped Pirate stopped; a new one is started
     ctx.log(f"units in place; {paths['unit']} starts with the deploy")
 
@@ -402,6 +432,7 @@ def uninstall(ctx, delete_data):
         kept.append(user.pw_dir)
     for unit in (paths["task"], paths["slice"], paths["socket"], paths["unit"]):
         (steps.UNITS_DIR / unit).unlink(missing_ok=True)
+    (paths["config"] / pirate_units.RECORD).unlink(missing_ok=True)  # it describes the units just removed
     target = pirate.config.with_name(pirate.config.name + ".uninstalled")
     pirate.config.rename(target)
     ctx.run("systemctl", "daemon-reload")
