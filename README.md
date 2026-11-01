@@ -11,6 +11,11 @@ Part of the [Pond family](https://github.com/the-boring-crocodile/boring-pond/bl
 shared libraries from [Pond Common](https://github.com/the-boring-crocodile/boring-pond-common/blob/main/README.md).
 All of it — code, tests, docs — was written by AI (OpenAI's models and Anthropic's Claude); Wald decided what to build, tested it, ran it and had the last word ([all of it is AI](https://github.com/the-boring-crocodile/boring-pond/blob/main/README.md#all-of-it-is-ai)).
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/pirates-dark.svg">
+  <img alt="A Pirate, a local agent a Pond gives work to: the Pirate registers its flavours with each Pond it may serve and answers its heartbeat; the Pond's worker hands one flavour an assignment over a local socket. Inside the Pirate's own Unix account and systemd sandbox, the Pirate keeps its state folder with the API key and transcripts, kept even from its own file tools; its home with the handbook and work, the only writable folder; and an executor that runs commands in a systemd unit with a deadline. It asks the Crocodile's service authority for a 60-second token for one service, calls the services its grants allow, and calls its model provider, a cloud API or a server on the LAN." src="docs/pirates.svg">
+</picture>
+
 ## Why
 
 A Pond's own model is not always the right worker. Some work is cheaper on a
@@ -32,9 +37,19 @@ A Pirate joins a running Pond that accepts guests (`service_registration_enabled
 This page continues the example site of boring-crocodile `docs/INSTALL.md`:
 the Crocodile at `crocodile-url.example.test` with the Ponds `pond` and
 `garden`; here we add the Pirate `parrot`. One command adds a Pirate, also
-next to Pirates already there:
+next to Pirates already there. From the download to the Pirate, in one
+shell (`V`: the release you install; the newest is on the
+[releases page](https://github.com/the-boring-crocodile/boring-pirates/releases)):
 
-    sudo /root/releases/boring-pirates-VERSION/deploy --install --name parrot --ponds all
+    V=0.3.10
+    f=boring-pirates-$V-linux-x86_64.tar.gz
+    u=https://github.com/the-boring-crocodile/boring-pirates/releases/download/v$V
+    mkdir -p ~/Downloads && cd ~/Downloads
+    curl -fLO "$u/$f" && curl -fLO "$u/$f.sha256" &&
+    sha256sum -c "$f.sha256" &&            # must print OK; if not, the block stops here
+    sudo mkdir -p /root/releases &&
+    sudo tar xzf "$f" -C /root/releases &&
+    sudo /root/releases/boring-pirates-$V/deploy --install --name parrot --ponds all
 
 Optional: `--account` (default `pirate-parrot`), `--display-name`,
 `--provider` (default `mistral`), `--model`, `--key-file`, `--groups`,
@@ -69,11 +84,22 @@ Pirates.
 
 All Pirates on a host run the same code from `/opt/boring-pirates`. That keeps
 one maintained runtime, but makes an update a shared interruption: finish or
-stop assignments on all affected Pirates first. Verify and unpack the release
-as described in [boring-deploy](https://github.com/the-boring-crocodile/boring-pond-common/blob/main/packages/boring-deploy/README.md#using-a-release), then:
+stop assignments on all affected Pirates first. Then, in one shell, with
+`V` the release you update to:
 
-    sudo /root/releases/boring-pirates-VERSION/deploy --check
-    sudo /root/releases/boring-pirates-VERSION/deploy
+    V=0.3.10
+    f=boring-pirates-$V-linux-x86_64.tar.gz
+    u=https://github.com/the-boring-crocodile/boring-pirates/releases/download/v$V
+    mkdir -p ~/Downloads && cd ~/Downloads
+    curl -fLO "$u/$f" && curl -fLO "$u/$f.sha256" &&
+    sha256sum -c "$f.sha256" &&            # must print OK; if not, the block stops here
+    sudo mkdir -p /root/releases &&
+    sudo tar xzf "$f" -C /root/releases &&
+    sudo /root/releases/boring-pirates-$V/deploy --check &&
+    sudo /root/releases/boring-pirates-$V/deploy
+
+How deploy checks and switches a release:
+[boring-deploy](https://github.com/the-boring-crocodile/boring-pond-common/blob/main/packages/boring-deploy/README.md#using-a-release).
 
 The first command inspects the release and host without changing them; the
 second performs the update. A plain
@@ -180,7 +206,7 @@ The result:
 |---|---|
 | `state`, `reason` | `completed`, `incomplete` (turn or output limit, truncated answer) or `timed_out`, and why; `provider_<reason>` when the provider failed (`rate_limited`, `unauthorized`, `unavailable`, `rejected`, `timed_out`, `invalid_response`) |
 | `answer` | the model's final text: a **claim** |
-| `write_actions`, `write_actions_count` | the first 32 successful writes, with root, path, bytes, SHA-256: **evidence** |
+| `write_actions`, `write_actions_count` | the first 32 successful file-tool writes (`file_write`, `file_patch`, `file_write_bytes`, a `service_call` answer saved to a file), with root, path, bytes, SHA-256: **evidence** of those, not of everything: changes made through `exec` or a service's own effects are not in it |
 | `tool_errors`, `tool_errors_count` | the first 32 failed tool calls |
 | `usage` | tokens (input, output, cached), turns, tool calls, finish reason |
 | `elapsed_seconds` | wall time |
