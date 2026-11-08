@@ -19,18 +19,18 @@ attrs==26.1.0 \
     # via
     #   jsonschema
     #   referencing
-boring-file-core==0.7.11 \
-    --hash=sha256:6b0bdc831b783915860e78cf02f747ff155afaed85afba0ff07fd1605f95addb
+boring-file-core==0.7.13 \
+    --hash=sha256:0b5664cfe7a3ce4cdc30c816bebb63b67ed59b096f2ddb680b5131ea54208117
     # via
     #   boring-pirates (pyproject.toml)
     #   boring-worker-kit
-boring-registry==0.7.11 \
-    --hash=sha256:9172df0feffe48215470ab5cc48e3ee9ff6ca36cf53a9532c2e30e4bb5d472fe
+boring-registry==0.7.13 \
+    --hash=sha256:dea2f119796bfe0353006403756bc1840dfbf79d21a5774d98d250377d417940
     # via
     #   boring-pirates (pyproject.toml)
     #   boring-worker-kit
-boring-worker-kit==0.7.11 \
-    --hash=sha256:ff8d822337bc902ac73dba057e29f60f0442ce476fea4bc1eb335e35cf4166c9
+boring-worker-kit==0.7.13 \
+    --hash=sha256:3b8b51c5bf4f4bc4c75c1dbc972e8fd50315b7f429429525d6d1287fdfeb9ed2
     # via boring-pirates (pyproject.toml)
 certifi==2026.7.22 \
     --hash=sha256:62f22742b58a1a33014a2b6b706588a8d7e2a88ae7bd1a6ebe8c992928483775 \

@@ -41,7 +41,7 @@ next to Pirates already there. From the download to the Pirate, in one
 shell (`V`: the release you install; the newest is on the
 [releases page](https://github.com/the-boring-crocodile/boring-pirates/releases)):
 
-    V=0.3.10
+    V=0.3.11
     f=boring-pirates-$V-linux-x86_64.tar.gz
     u=https://github.com/the-boring-crocodile/boring-pirates/releases/download/v$V
     mkdir -p ~/Downloads && cd ~/Downloads
@@ -50,6 +50,19 @@ shell (`V`: the release you install; the newest is on the
     sudo mkdir -p /root/releases &&
     sudo tar xzf "$f" -C /root/releases &&
     sudo /root/releases/boring-pirates-$V/deploy --install --name parrot --ponds all
+
+The release tags are `vX.Y.Z`; each Linux archive is
+`boring-pirates-X.Y.Z-linux-x86_64.tar.gz`, with a matching `.sha256`.
+A checksum from the same release page detects corruption, not authenticated
+origin. [Recorded combinations](https://github.com/the-boring-crocodile/boring-pond/blob/main/docs/updating.md#releases-and-versions)
+name the Common and Crocodile releases exercised with it.
+
+The shipped Linux runtime targets x86_64 and runs under systemd. Tool
+execution is local to the Pirate's account; inference goes over HTTP to
+the configured Mistral or OpenAI-compatible endpoint. A local endpoint
+still needs its own model server, resources and access policy. Hosted
+providers may charge for calls; installing a Pirate does not supply a
+model subscription.
 
 Optional: `--account` (default `pirate-parrot`), `--display-name`,
 `--provider` (default `mistral`), `--model`, `--key-file`, `--groups`,
@@ -87,7 +100,7 @@ one maintained runtime, but makes an update a shared interruption: finish or
 stop assignments on all affected Pirates first. Then, in one shell, with
 `V` the release you update to:
 
-    V=0.3.10
+    V=0.3.11
     f=boring-pirates-$V-linux-x86_64.tar.gz
     u=https://github.com/the-boring-crocodile/boring-pirates/releases/download/v$V
     mkdir -p ~/Downloads && cd ~/Downloads

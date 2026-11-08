@@ -3,6 +3,13 @@
 Notable changes per release, newest first ([Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 [SemVer](https://semver.org/); tags `vX.Y.Z`, candidates `vX.Y.Z-rc.N`).
 
+## 0.3.11 — 2026-11-08
+
+0.3.10 on Pond Common 0.7.13, plus documentation fixes (install blocks, release prerequisites, a picture of the whole).
+
+- Relocked on Pond Common 0.7.13: the deploy's numbered step lines are flushed as they are
+  printed, so through a pipe they keep their order with the hooks' output and a `FAILED` line.
+
 ## 0.3.10 — 2026-10-31
 
 Upgrades from 0.3.5, as the public upgrade test found them (built on Pond Common 0.7.11):
