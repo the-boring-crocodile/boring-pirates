@@ -13,7 +13,7 @@ the one code HOME (/opt/boring-pirates). What install makes for NAME:
                 --key-file, or typed at the terminal (hidden); one already there is kept
     the Pond    `boring-crocodile-admin pirate-add NAME --account ACCOUNT --ponds ...`:
                 the Crocodile's own plan and apply (site-check first); its answer
-                gives config.json the Pond workers' uids and the service authority
+                gives config.json the controller service authority; the description owns admission
     config.json /etc/boring-pirates/NAME/config.json: "provider" at the top (--provider),
                 one flavour, default (--model, the provider's default settings); the
                 operator's from then on (more flavours and the provider's block go there)
@@ -37,13 +37,15 @@ import grp
 import json
 import os
 import pwd
+import re
+import stat
 import sys
-import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 from boring_install import Failure, Look, Setting, seal
+from boring_deploy import root_input
 
 import pirate_units
 import steps
@@ -67,7 +69,6 @@ SETTINGS = [
 CAPS = {"max_turns": 60, "max_output_tokens": 8192}  # upper bounds for overrides (the code's defaults too)
 CLIENTS = "pirate-clients"
 CROCODILE = Path("/opt/boring-crocodile/current/bin/boring-crocodile-admin")
-CROCODILE_CONFIG = Path("/etc/boring-crocodile/config.toml")
 HOMES = Path("/home")
 STATE = Path("/var/lib")
 
@@ -113,13 +114,56 @@ def _refuse_links_in(home):
                       "install writes there as root and follows no links: replace them by what they point to")
 
 
-def _callers():
-    """The Crocodile's Pirates (name -> uid), from its config as it is."""
+def _refuse_retained_paths(name, account):
+    """Never turn a removed account's sealed data into a new Pirate's data."""
+    paths, user = _paths(name), _user(account)
+    homes, saved = {_home(account)}, None
+    record_path = paths["config"] / pirate_units.RECORD
+    if os.path.lexists(record_path):
+        saved = pirate_units.read_record(name).get("retained_account")
+        if saved:
+            homes.add(Path(saved["home"]))
+    retained = [path for path in (*sorted(homes), paths["state"])
+                if os.path.lexists(path) and (user is None or path.lstat().st_uid != user.pw_uid)]
+    if user is None and (saved or os.path.lexists(paths["config"] / f"{steps.CONFIG_NAME}.uninstalled")):
+        retained.append(paths["config"])
+    if retained:
+        if os.path.lexists(paths["config"]) and paths["config"] not in retained:
+            retained.append(paths["config"])
+        raise Failure("retained paths from an earlier Pirate; nothing is changed: "
+                      + ", ".join(map(str, retained)),
+                      "the operator must decide whether to move or delete these paths before installing again")
+
+
+def _inventory(ctx):
+    """Read the Crocodile-owned admin contract; never interpret its description."""
+    hint = "deploy Crocodile from the matching release set; its admin list --json must include pond_workers UIDs"
+    reply = ctx.run(str(CROCODILE), "list", "--json", check=False)
+    if reply.returncode != 0:
+        raise Failure("Crocodile admin inventory failed", hint)
     try:
-        raw = tomllib.loads(CROCODILE_CONFIG.read_text())
-    except (OSError, ValueError):
-        return {}
-    return dict(raw.get("pirate_services", {}).get("callers", {}))
+        data = json.loads(reply.stdout)
+    except (TypeError, ValueError):
+        raise Failure("Crocodile admin inventory is not JSON", hint) from None
+    if (not isinstance(data, dict) or set(data) != {"public_base_url", "ponds", "pirates", "pond_workers"}
+            or not isinstance(data["public_base_url"], str) or not data["public_base_url"]
+            or not isinstance(data["ponds"], list)
+            or any(not isinstance(name, str) or not name for name in data["ponds"])
+            or len(set(data["ponds"])) != len(data["ponds"])
+            or not isinstance(data["pirates"], dict)
+            or any(not isinstance(name, str) or not name or type(uid) is not int or uid <= 0
+                   for name, uid in data["pirates"].items())
+            or not isinstance(data["pond_workers"], dict)
+            or any(not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9-]*", name)
+                   or type(uid) is not int or uid <= 0 for name, uid in data["pond_workers"].items())
+            or set(data["ponds"]) - set(data["pond_workers"])):
+        raise Failure("Crocodile admin inventory has an invalid shape", hint)
+    return data
+
+
+def _callers(ctx):
+    """The admitted Pirates (name -> uid), owned by the Crocodile."""
+    return _inventory(ctx)["pirates"]
 
 
 # -- reality -----------------------------------------------------------------
@@ -139,13 +183,14 @@ def look(ctx):
         irregular.append(f"{name}: units without a Pirate (no {paths['file']}): {', '.join(leftovers)}")
     if paths["file"].exists():
         irregular.append(f"{paths['file']} exists without {paths['unit']}")
-    callers = _callers()
+    callers = _callers(ctx)
     if name in callers:
         notes.append(f"the Crocodile admits {name} already (uid {callers[name]}): kept")
     for kept in (paths["credentials"], paths["state"], paths["config"] / f"{steps.CONFIG_NAME}.uninstalled"):
         if kept.exists():
-            notes.append(f"{kept} from an earlier install: " + ("left as it is" if kept.suffix else "reused"))
-    return Look(False, irregular, notes)
+            notes.append(f"{kept}: retained from an earlier install")
+    return Look(False, irregular, notes,
+                retained=(paths["config"] / f"{steps.CONFIG_NAME}.uninstalled").is_file())
 
 
 def ready(ctx, settings):
@@ -156,12 +201,12 @@ def ready(ctx, settings):
         raise Failure(f"no Crocodile at {CROCODILE}", "a Pirate serves a running Pond: install the Crocodile first")
     if ctx.run(str(CROCODILE), "pirate-add", "--help", check=False).returncode != 0:
         raise Failure("this Crocodile cannot admit Pirates (pirate-add)", "deploy a newer Crocodile first")
-    raw = tomllib.loads(CROCODILE_CONFIG.read_text())
+    inventory = _inventory(ctx)
     ponds = settings["ponds"].split(",")
-    unknown = [pond for pond in ponds if pond != "all" and pond not in raw.get("ponds", {})]
+    unknown = [pond for pond in ponds if pond != "all" and pond not in inventory["ponds"]]
     if unknown:
         raise Failure("not a Pond of this site: " + ", ".join(unknown))
-    callers = _callers()
+    callers = inventory["pirates"]
     user = _user(account)
     if name in callers and (user is None or callers[name] != user.pw_uid):
         raise Failure(f"the Crocodile admits another account as {name}", f"boring-crocodile-admin pirate-remove {name}")
@@ -174,11 +219,13 @@ def ready(ctx, settings):
         except KeyError:
             raise Failure(f"no group {group}") from None
     key = _paths(name)["credentials"] / f"{settings['provider']}-api-key"
-    if settings["key_file"] and not Path(settings["key_file"]).is_file():
-        raise Failure(f"--key-file: {settings['key_file']} is not a file")
+    if settings["key_file"]:
+        with root_input(Path(settings["key_file"]).expanduser().absolute()):
+            pass
     if settings["provider"] == "mistral" and not settings["key_file"] and not key.exists() and not sys.stdin.isatty():
         raise Failure("the API key: --key-file, or a terminal to type it at")
     _refuse_links_in(_home(account))
+    _refuse_retained_paths(name, account)
 
 
 def _unit_user(ctx, pirate):
@@ -200,13 +247,16 @@ def plan(ctx, settings):
                  "(kept if there, else local placeholder)" if settings["provider"] == "openai_compat" else
                  "(kept if there, else typed now)"),
               f"the Pond: boring-crocodile-admin pirate-add {name} --account {account} --ponds {settings['ponds']}"
-              " (restarts the controller and any worker that joins pirate-clients)",
+              " (restarts the controller and every enabled worker)",
               f"{paths['file']}: flavour default, {settings['provider']} {settings['model']}",
               f"units {paths['socket']}, {paths['task']}, {paths['slice']}, {paths['unit']}"
               + (f" (also in groups {settings['groups']})" if settings["groups"] else ""),
               "then the deploy: every Pirate here restarts and answers its pings"]
     if endpoint is not None:
         lines.append(f"provider endpoint: {endpoint} (network access control is deployment-owned)")
+    if settings["key_file"]:
+        with root_input(Path(settings["key_file"]).expanduser().absolute()) as source:
+            lines.extend(source.describe())
     return lines
 
 
@@ -252,7 +302,7 @@ def provider_endpoint(provider, value):
     return value.rstrip("/")
 
 
-def site_document(directory, *, name, home, provider, model, client_uids, authority, endpoint=None,
+def site_document(directory, *, name, home, provider, model, authority, endpoint=None,
                   lab=False):
     """The Pirate's config.json: provider at the top, one fixed flavour (default) from
     the release's profile.json with the provider's default settings and its handbook;
@@ -270,7 +320,6 @@ def site_document(directory, *, name, home, provider, model, client_uids, author
     document = {
         "provider": provider,
         "checkout": str(home / "work"),
-        "client_uids": client_uids,
         "descriptor_file": str(home / "handbook" / "descriptor.json"),
         "default_timeout_seconds": 120, "max_timeout_seconds": 600, "retention_seconds": 604800,
         "provider_request_timeout_seconds": 300,
@@ -288,15 +337,17 @@ def site_document(directory, *, name, home, provider, model, client_uids, author
 
 
 def _admit(ctx, name, account, ponds):
-    """The Crocodile's own plan, then its apply of exactly that plan."""
+    """Let the Crocodile show and confirm its plan, then read the admitted settings."""
     command = [str(CROCODILE), "pirate-add", name, "--account", account, "--ponds", ponds]
-    planned = json.loads(ctx.run(*command).stdout)
-    outcome = json.loads(ctx.run(*command, "--apply", "--approve-digest", planned["plan_digest"]).stdout)
-    if outcome.get("status") != "admitted":
-        raise Failure(f"the Crocodile admitted {name} but reports {outcome.get('status')}",
+    ctx.run(*command, "--apply", capture=False, interactive=True)
+    # The interactive command owns stdout/stderr. A read-only rerun verifies the
+    # admission and returns the controller authority without hiding the prompt.
+    outcome = json.loads(ctx.run(*command).stdout)
+    if outcome.get("status") != "already_serves":
+        raise Failure(f"the Crocodile admission of {name} reports {outcome.get('status')}",
                       "boring-crocodile-admin site-check; status --check")
-    ctx.log(f"the Pond admits {name}: serves {', '.join(planned['ponds'])}")
-    return outcome["for_site_json"]  # the key of the Crocodile's answer (an interface: kept)
+    ctx.log(f"the Pond admits {name}: serves {', '.join(outcome['ponds'])}")
+    return outcome["service_authority"]
 
 
 def install(ctx, settings):
@@ -304,6 +355,14 @@ def install(ctx, settings):
     name, account = ctx.instance, _account(ctx, settings)
     paths = _paths(name)
     _refuse_links_in(_home(account))  # again, just before the first change
+    _refuse_retained_paths(name, account)
+    supplied_key = None
+    if settings["key_file"]:
+        # Validate and read before changing accounts, directories or admission.
+        with root_input(Path(settings["key_file"]).expanduser().absolute()) as source:
+            supplied_key = source.read_text()
+        if not supplied_key.strip() and not (paths["credentials"] / f"{settings['provider']}-api-key").exists():
+            raise Failure("no API key given")
     ctx.home.mkdir(mode=0o755, parents=True, exist_ok=True)
     if _user(account) is None:
         ctx.run("useradd", "--system", "--user-group", "--create-home", "--home-dir", str(HOMES / account),
@@ -341,7 +400,7 @@ def install(ctx, settings):
     paths["credentials"].mkdir(mode=0o700, parents=True, exist_ok=True)
     key = paths["credentials"] / f"{settings['provider']}-api-key"
     if not key.exists():
-        secret = (Path(settings["key_file"]).read_text() if settings["key_file"]
+        secret = (supplied_key if supplied_key is not None
                   else "local" if settings["provider"] == "openai_compat"
                   else getpass.getpass(f"  {settings['provider']} API key for {name} (not shown): "))
         if not secret.strip():
@@ -349,7 +408,7 @@ def install(ctx, settings):
         _write(key, secret.strip() + "\n", 0o600)
         ctx.log(f"key stored in {key}")
     ctx.log(f"{home}: work/ and handbook/ ready; {paths['state']} ready")
-    callers = _callers()
+    callers = _callers(ctx)
     if name in callers:
         if not paths["file"].exists():
             raise Failure(f"the Crocodile admits {name} already, but its {paths['file']} is missing",
@@ -359,7 +418,7 @@ def install(ctx, settings):
         pond = _admit(ctx, name, account, settings["ponds"])
         site = site_document(ctx.release.directory, name=name, home=home,
                              provider=settings["provider"], model=settings["model"],
-                             client_uids=pond["client_uids"], authority=pond["service_authority"], endpoint=endpoint,
+                             authority=pond, endpoint=endpoint,
                              lab=settings.get("lab") == "yes")
         _write(paths["file"], json.dumps(site, indent=2) + "\n", 0o644)
         ctx.log(f"wrote {paths['file']} (yours from now on: more flavours go there)")
@@ -387,15 +446,9 @@ def install(ctx, settings):
 NOT_RUNNING = ("inactive", "failed")  # what `systemctl is-active` says of a unit that runs nothing
 
 
-def _stop(ctx, paths):
-    """The Pirate, its socket and its task slice (every task it runs) stopped,
-    and checked: a failed stop, or a unit that still runs, stops the uninstall
-    before anything is removed."""
-    units = [paths["unit"], paths["socket"]]
-    ctx.run("systemctl", "disable", "--now", *units)
-    ctx.run("systemctl", "stop", paths["slice"], check=False)  # verified below, like the others
+def _inactive(ctx, paths):
     running = {}
-    for unit in (*units, paths["slice"]):
+    for unit in (paths["unit"], paths["socket"], paths["slice"]):
         state = ctx.run("systemctl", "is-active", unit, check=False).stdout.strip()
         if state not in NOT_RUNNING:
             running[unit] = state or "unknown"
@@ -403,39 +456,96 @@ def _stop(ctx, paths):
         raise Failure("still running after the stop, so nothing is removed: "
                       + ", ".join(f"{unit} {state}" for unit, state in running.items()),
                       f"systemctl status {' '.join(running)}; once stopped, run uninstall again")
+
+
+def _stop(ctx, paths):
+    """Stop and verify the Pirate, its socket and all tasks before removal."""
+    units = [paths["unit"], paths["socket"]]
+    ctx.run("systemctl", "disable", "--now", *units)
+    ctx.run("systemctl", "stop", paths["slice"], check=False)
+    _inactive(ctx, paths)
     ctx.log(f"stopped: {', '.join(units)} and {paths['slice']} are inactive")
 
 
+def _retained_user(ctx, paths):
+    """Use retained identity; older removals can be identified by their owned home."""
+    if os.path.lexists(paths["config"] / pirate_units.RECORD):
+        record = pirate_units.read_record(ctx.instance)
+        user = _user(record["account"])
+        saved = record.get("retained_account")
+        if user is not None and saved is not None and (
+                user.pw_uid != saved["uid"] or user.pw_dir != saved["home"]):
+            raise Failure("the retained Pirate account identity changed; nothing is removed")
+        return user
+    saved = paths["config"] / f"{steps.CONFIG_NAME}.uninstalled"
+    try:
+        raw = json.loads(pirate_units.read_nofollow(saved))
+        checkout = raw["checkout"]
+        if not isinstance(checkout, str) or not Path(checkout).is_absolute():
+            raise ValueError("no absolute checkout")
+        home = Path(checkout).parent
+        info = home.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid == 0:
+            raise ValueError("the retained home is not an account-owned directory")
+        try:
+            user = pwd.getpwuid(info.st_uid)
+        except KeyError:
+            return None
+        if Path(user.pw_dir) != home:
+            raise ValueError("the account's home differs from the retained configuration")
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        raise Failure(f"cannot identify the retained Pirate account: {error}",
+                      "inspect the retained config, home and account; restore its rendered.json account record") from None
+    return user
+
+
 def uninstall(ctx, delete_data):
-    """Stop (verified), out of the Pond, with delete_data seal and remove the
-    account, then the units and config.json: those two make look say installed,
-    so they go last and a rerun after a failure before them finishes the job."""
+    """Keep data and account identity; --delete-data also finishes an earlier removal."""
     name = ctx.instance
-    (pirate,) = [p for p in steps.pirates() if p.name == name]
+    pirate = next((p for p in steps.pirates() if p.name == name), None)
     paths = _paths(name)
-    account = _unit_user(ctx, pirate)
-    _stop(ctx, paths)
-    if name in _callers():
+    target = paths["config"] / f"{steps.CONFIG_NAME}.uninstalled"
+    if pirate is not None:
+        account = _unit_user(ctx, pirate)
+        _stop(ctx, paths)
+        user = _user(account) if account else None
+    else:
+        if not delete_data or not target.is_file():
+            raise Failure(f"no installed or retained Pirate {name}")
+        user = _retained_user(ctx, paths)
+        account = user.pw_name if user is not None else None
+        if account and any(_unit_user(ctx, other) == account for other in steps.pirates()):
+            raise Failure(f"account {account} belongs to another installed Pirate; nothing is removed")
+        _inactive(ctx, paths)
+    if delete_data or name in _callers(ctx):
         command = [str(CROCODILE), "pirate-remove", name]
-        planned = json.loads(ctx.run(*command).stdout)
-        ctx.run(*command, "--apply", "--approve-digest", planned["plan_digest"])
-        ctx.log(f"the Pond no longer admits {name}")
-    user = _user(account) if account else None
+        if delete_data:
+            command.append("--retire")
+        ctx.run(*command, "--apply", capture=False, interactive=True)
+        ctx.log(f"the Pond no longer admits {name}"
+                + ("; its service caller grants are revoked" if delete_data else ""))
     kept = []
-    if delete_data and user is not None:
+    if user is not None:
+        if user.pw_uid == 0:
+            raise Failure("the Pirate account is root; it is not removed")
         home = Path(user.pw_dir)
-        seal(ctx, [home, paths["state"]], user.pw_uid)  # raises: the account stays, for a rerun
-        ctx.run("userdel", account)
-        ctx.log(f"account {account} removed; what it owned is sealed (root's, 0700)")
+        record_path = paths["config"] / pirate_units.RECORD
+        record = pirate_units.read_record(name) if os.path.lexists(record_path) else {"units": {}, "groups": []}
+        pirate_units.write_record(name, record["units"], ctx.release.version, account, record["groups"],
+                                  retained_account={"uid": user.pw_uid, "home": user.pw_dir})
+        if delete_data:
+            seal(ctx, [home, paths["state"]], user.pw_uid)
+            ctx.run("userdel", account)
+            ctx.log(f"account {account} removed; what it owned is sealed (root's, 0700)")
         kept.append(str(home))
-    elif user is not None:
-        kept.append(user.pw_dir)
     for unit in (paths["task"], paths["slice"], paths["socket"], paths["unit"]):
         (steps.UNITS_DIR / unit).unlink(missing_ok=True)
-    (paths["config"] / pirate_units.RECORD).unlink(missing_ok=True)  # it describes the units just removed
-    target = pirate.config.with_name(pirate.config.name + ".uninstalled")
-    pirate.config.rename(target)
-    ctx.run("systemctl", "daemon-reload")
+    record = paths["config"] / pirate_units.RECORD
+    if record.exists():
+        kept.append(str(record))
+    if pirate is not None:
+        pirate.config.rename(target)
+        ctx.run("systemctl", "daemon-reload")
     kept.insert(0, str(target))
     kept += [str(path) for path in (paths["state"], paths["credentials"]) if path.exists()]
     if not steps.pirates():

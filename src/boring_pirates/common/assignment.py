@@ -17,7 +17,9 @@ from .limits import MAX_ANSWER, MAX_CONVERSATION, MAX_TOOL_RESULT
 from .profiles import ResolvedProfile, TOOLS
 from .providers import ProviderFailure
 from .runtime import ToolRuntime, settled
-from boring_worker_kit.outcomes import Refusal
+from boring_worker_kit.outcomes import Refused
+from boring_outcomes import Failed
+from .outcomes import failure_data
 from boring_worker_kit.services import ServiceFailure
 from boring_worker_kit.task_client import ContainmentError
 from boring_worker_kit.execution import ForegroundInterrupted
@@ -29,7 +31,7 @@ SAVE_PROBLEMS = ("save_to_refused", "save_to_failed")  # a service_call save tha
 # A turn with neither text nor a tool call is asked again, at most this often per
 # assignment. Local servers can drop a tool call they fail to parse (observed:
 # Ollama 0.40.10 with Gemma 4, about every second turn after a file read); a new
-# sample usually parses. An empty final answer after the retries stays empty.
+# sample usually parses. Exhausted empty answers are incomplete, with receipts kept.
 EMPTY_TURN_RETRIES = 3
 WRITE_REMINDER = ("You have made {calls} tool calls and written no file yet. Write the file the "
                   "assignment asks for now, with what you have; list what you could not settle "
@@ -134,6 +136,8 @@ async def run(provider, checkout: Path, profile: ResolvedProfile, history: FileH
                 history.append("empty_turn", {"retry": usage["empty_turn_retries"]})
                 continue
             if not turn.calls:
+                if not turn.text.strip():
+                    return finish("incomplete", "empty_answer", answer=turn.text)
                 if len(turn.text.encode()) > MAX_ANSWER:
                     return finish("incomplete", "answer_limit")
                 return finish("completed", answer=turn.text)
@@ -157,17 +161,17 @@ async def run(provider, checkout: Path, profile: ResolvedProfile, history: FileH
                 history.append("tool_intent", call)
                 try:
                     if "error" in call:  # malformed by the model; the provider says what
-                        raise ValueError(call["error"])
+                        raise Refused("invalid_request", call["error"])
                     if call["name"] == "service_call":
                         budget = profile.spec.max_service_calls
                         if budget is not None and usage["service_calls"] >= budget:
-                            raise ValueError(f"service_call budget of {budget} for this assignment is used up: "
+                            raise Refused("limit", f"service_call budget of {budget} for this assignment is used up: "
                                              "write your result now with what you have; list the gaps under DOUBTS")
                         usage["service_calls"] += 1
                     if call["name"] not in profile.spec.tools:
                         allowed = ", ".join(sorted(profile.spec.tools)) or "none"
                         known = "is disabled by profile" if call["name"] in TOOLS else "is unknown"
-                        raise ValueError(f"tool {call['name']!r} {known}; allowed tools: {allowed}")
+                        raise Refused("invalid_request", f"tool {call['name']!r} {known}; allowed tools: {allowed}")
                     # Bound now: a cancelled call may settle after the loop moved on.
                     def record_write(value, call=call):
                         if call["name"] in {"file_write", "file_patch", "file_write_bytes"}:
@@ -185,17 +189,19 @@ async def run(provider, checkout: Path, profile: ResolvedProfile, history: FileH
                                                        "settled_after_timeout" if after_timeout
                                                        else "settled_after_cancellation": True})
                     if call["name"] == "view_image":
+                        if image is not None:
+                            raise Refused("limit", "one image per turn; ask for the next image in a later turn")
                         args = call["arguments"]
                         if set(args) != {"root", "path"} or not all(isinstance(args[k], str) for k in args):
-                            raise ValueError("view_image arguments: exactly root and path, both strings")
+                            raise Refused("invalid_request", "view_image arguments: exactly root and path, both strings")
                         value, url = await read_image(files, call["id"], args["root"], args["path"])
                         image = (args["path"], url)
                     else:
                         value = await runtime.dispatch(files, profile.spec, call, deadline, cancelled_result)
                     record_write(value)
                     if len(json.dumps(value, ensure_ascii=True).encode()) > MAX_TOOL_RESULT:
-                        raise ServiceFailure({"status": "failed", "code": "limit", "message": "tool result exceeds limit",
-                                              "effects": "unknown" if call["name"] == "service_call" else "completed"})
+                        raise Failed("limit", "tool result exceeds limit",
+                                     effects="unknown" if call["name"] == "service_call" else "completed")
                     outcome = {"ok": True, "value": value}
                     save = (next((code for code in SAVE_PROBLEMS if code in value), None)
                             if call["name"] == "service_call" and isinstance(value, dict) else None)
@@ -207,34 +213,33 @@ async def run(provider, checkout: Path, profile: ResolvedProfile, history: FileH
                         detail = value[save] if isinstance(value[save], dict) else {}
                         message = (f"the service answered, but its answer was not saved ({save}"
                                    + (f": {detail.get('code') or detail.get('message')}" if detail else "") + ")")
-                        outcome = {"ok": False, "error": message, "code": save, "value": value,
-                                   "failure": {"status": "failed", "code": save,
-                                               "effects": "unknown" if save == "save_to_failed" else "completed",
-                                               "message": message}}
+                        outcome = {"ok": False, "value": value,
+                                   "failure": Failed(save, message,
+                                       effects="unknown" if save == "save_to_failed" else "completed").as_data()}
                         errors.append({"tool": "service_call", "error": message[:MAX_TOOL_ERROR_TEXT],
                                        "status": "failed"})
 
-                except Refusal as error:
-                    outcome = {"ok": False, "error": str(error), "status": "refused", **error.as_data()}
-                    next_step = hint(call["name"], outcome, profile.spec.tools)
+                except Refused as error:
+                    data = error.as_data()
+                    outcome = {"ok": False, "refusal": data}
+                    next_step = hint(call["name"], data, profile.spec.tools)
                     if next_step:
                         outcome["hint"] = next_step
-                    fields = outcome.get("fields")  # argument names only, never values
+                    fields = data.get("fields")  # argument names only, never values
                     text = str(error) + (f" (fields: {', '.join(map(str, fields))})"
                                          if isinstance(fields, list) and fields else "")
                     errors.append({"tool": call["name"][:64], "error": text[:MAX_TOOL_ERROR_TEXT]})
                 except ContainmentError:
                     raise  # admission is poisoned by the shared executor; fatal cleanup failure
-                except (ServiceFailure, ForegroundInterrupted, RuntimeError, OSError) as error:
-                    data = error.data if isinstance(error, ServiceFailure) else {
-                        "status": "failed", "effects": "unknown", "message": str(error)}
-                    outcome = {"ok": False, "error": str(error), "failure": data}
-                    errors.append({"tool": call["name"][:64], "error": str(error)[:MAX_TOOL_ERROR_TEXT], "status": "failed"})
+                except (Failed, ServiceFailure, ForegroundInterrupted, RuntimeError, OSError) as error:
+                    outcome = {"ok": False, "failure": failure_data(error)}
+                    errors.append({"tool": call["name"][:64], "error": outcome["failure"]["message"][:MAX_TOOL_ERROR_TEXT], "status": "failed"})
                 except (ValueError, UnicodeError, TypeError) as error:
-                    # The model sees the refusal (stale edit, bad path) and can act on it.
-                    outcome = {"ok": False, "error": f"{type(error).__name__}: {error}"}
+                    # Typed input refusals were caught above. An untyped programming/decoding
+                    # error after dispatch has unknown effects.
+                    outcome = {"ok": False, "failure": failure_data(error)}
                     name = call["name"][:64] if isinstance(call["name"], str) else None
-                    errors.append({"tool": name, "error": outcome["error"][:MAX_TOOL_ERROR_TEXT]})
+                    errors.append({"tool": name, "error": outcome["failure"]["message"][:MAX_TOOL_ERROR_TEXT], "status": "failed"})
                 history.append("tool_result", {"id": call["id"], **outcome})
                 messages.append({"role": "tool", "tool_call_id": call["id"],
                                  "content": json.dumps(outcome, ensure_ascii=True)})

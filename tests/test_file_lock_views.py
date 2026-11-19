@@ -10,7 +10,7 @@ from unittest.mock import patch
 from boring_pirates.common.files import CheckoutFiles
 from boring_worker_kit.file_policy import FilePolicy
 from boring_worker_kit import files
-from boring_worker_kit.outcomes import Refusal
+from boring_worker_kit.outcomes import Refused
 
 
 class FileLockViewsTest(unittest.TestCase):
@@ -50,7 +50,7 @@ class FileLockViewsTest(unittest.TestCase):
                             'path': 'child/note' if index == 0 else second_path,
                             'content': str(index), 'expected_sha256': expected})
                         return 'written'
-                    except Refusal as error:
+                    except Refused as error:
                         return error.code
                     except ValueError as error:
                         if str(error).startswith('stale edit:'):

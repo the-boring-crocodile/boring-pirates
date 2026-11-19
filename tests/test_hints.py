@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 
 from boring_pirates.common.hints import field_hint, hint
 from boring_pirates.common.runtime import ToolRuntime
-from boring_worker_kit.outcomes import Refusal
+from boring_worker_kit.outcomes import Refused
 
 
 class HintTest(unittest.TestCase):
@@ -58,7 +58,7 @@ class HintTest(unittest.TestCase):
 class ServiceArgumentsTest(unittest.IsolatedAsyncioTestCase):
     async def refusal(self, name, args):
         runtime = ToolRuntime(authority=AsyncMock())
-        with self.assertRaises(Refusal) as caught:
+        with self.assertRaises(Refused) as caught:
             await runtime.dispatch(None, None, {"id": "1", "name": name, "arguments": args}, 0.0)
         return caught.exception
 

@@ -3,6 +3,32 @@
 Notable changes per release, newest first ([Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 [SemVer](https://semver.org/); tags `vX.Y.Z`, candidates `vX.Y.Z-rc.N`).
 
+## 0.4.0 — 2026-11-19
+
+### Upgrading
+
+Update with Crocodile 0.5.0 in the same maintenance window. Keep Pirate
+work stopped until the paired update and site checks succeed. This build
+carries Common 0.8.0 and requires x86_64, glibc 2.39 or newer and Python
+3.12 or newer.
+
+After adopting the Crocodile site, review the `pirate-add` plans named by
+the Pirates check. Apply the intended admissions and replace legacy
+`client_uids` with the current authority configuration before retrying.
+Apply the Crocodile site render so both Pirate serving processes and their
+commands run in slices covered by the protected-port bind policy. See the
+[paired update guide](https://github.com/the-boring-crocodile/boring-pond/blob/main/docs/updating.md).
+
+### Changes
+
+- Crocodile owns each Pirate's admitted Ponds. The Pirate verifies live
+  worker registration and drops trust when the admission is withdrawn.
+- Flavours can narrow the current service grants with `allowed_services`.
+  Changes to the Crocodile's grants take effect without restarting Pirates.
+- Install and removal show plans for review. Permanent retirement revokes
+  the Pirate's service grants and seals the retained home and state.
+- Typed outcomes and clearer preflight refusals name what needs attention.
+
 ## 0.3.11 — 2026-11-08
 
 0.3.10 on Pond Common 0.7.13, plus documentation fixes (install blocks, release prerequisites, a picture of the whole).

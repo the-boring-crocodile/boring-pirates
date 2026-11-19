@@ -7,7 +7,7 @@ are found on the host, never in a record: boring-pirate@NAME.service with
 Each runs HOME/current/bin/...; a deploy parses each configuration with the new
 code as that Pirate, restarts the Pirates that run (the engine's switch decides
 by `systemctl is-active`; a stopped Pirate stays stopped) and pings every active
-flavour of each restarted Pirate as one of its clients.
+flavour of each restarted Pirate as a live worker accepted by its runtime.
 
 The units are rendered again from the new release's templates (pirate_units.py):
 the check plans it and stops before any change when a unit is not what a deploy
@@ -17,7 +17,7 @@ changed units with a backup, so the switch's restart runs the Pirates on them.
 `deploy --check` runs only the engine's step 1, without the new code's venv, so
 it cannot parse the configuration as the release check does. It does report,
 with the standard library, every shape an upgrade must change first
-(upgrade_problems): all of them at once, the same list the deploy then starts
+(preflight): all of them at once, the same list the deploy then starts
 with, before anything is prepared.
 """
 import json
@@ -31,10 +31,12 @@ CONFIG_DIR = pirate_units.CONFIG_DIR
 CONFIG_NAME = "config.json"  # CONFIG_DIR/NAME/config.json: one Pirate's configuration
 STATE_BASE = Path("/var/lib")  # where systemd puts a system unit's StateDirectory=
 RUNTIME_BASE = Path("/run")  # and its RuntimeDirectory=
+REGISTER_GLOB = "/run/boring-crocodile/guests/*/register.sock"
 SOCKET_NAME = "pirate.sock"  # common/ipc.py's: the Pirate's socket in its RuntimeDirectory=
 # Shapes earlier releases installed that this one refuses (CHANGELOG, Upgrade), and what replaces them.
 OLD_CONFIG_KEYS = {"socket": "the unit's RuntimeDirectory=", "history_dir": "the unit's StateDirectory=",
-                   "key_file": "the unit's LoadCredential="}  # gone in 0.3.9
+                   "key_file": "the unit's LoadCredential=",
+                   "client_uids": "Pirate/Pond admission in the Crocodile description"}
 OLD_PROFILE_KEYS = {"context_files": "handbook (the one file it named)",
                     "instructions": "handbook"}  # gone since 0.3.5 (PF1)
 
@@ -148,7 +150,37 @@ def _credentials(ctx, pirate):
     return found
 
 
-def upgrade_problems(ctx):
+def _legacy_admission(ctx, pirate, uids):
+    """Read-only replacement advice from the Crocodile's one identity inventory."""
+    import boring_deploy
+    from install_steps import _inventory
+    prefix = f"{pirate.name}: {pirate.config}: client_uids refused; admission belongs in the Crocodile description"
+    if not isinstance(uids, list) or any(type(uid) is not int or uid <= 0 for uid in uids):
+        return [prefix, f"{pirate.name}: client_uids must be a list of positive integer UIDs"]
+    if not uids:
+        return [prefix, f"{pirate.name}: no pirate-add command is needed; remove the empty client_uids field"]
+    try:
+        inventory = _inventory(ctx)
+    except boring_deploy.Failure as error:
+        return [prefix, f"{pirate.name}: UID mapping unavailable: {error}; {error.hint}"]
+    chosen, problems = set(), []
+    for uid in sorted(set(uids)):
+        names = sorted(name for name, worker_uid in inventory["pond_workers"].items() if worker_uid == uid)
+        if len(names) != 1:
+            problems.append(f"{pirate.name}: " + (f"unmapped UID {uid}" if not names
+                            else f"ambiguous UID {uid}: " + ",".join(names)))
+        else:
+            chosen.add(names[0])
+    if problems:
+        return [prefix, *problems]
+    command = f"boring-crocodile-admin pirate-add {pirate.name} --ponds " + ",".join(sorted(chosen))
+    parked = chosen - set(inventory["ponds"])
+    return [prefix, f"{pirate.name}: after Crocodile adoption, review and run: {command}",
+            *([f"{pirate.name}: bring back parked Ponds first: " + ",".join(sorted(parked))] if parked else []),
+            f"{pirate.name}: confirm the admission plan with --apply, then remove client_uids and retry; nothing applied"]
+
+
+def preflight(ctx):
     """Every shape on the host this release refuses, as lines; read-only and standard
     library only (deploy --check has no venv of the new release). The release check
     remains the authority: it parses each configuration completely, as the Pirate."""
@@ -161,7 +193,9 @@ def upgrade_problems(ctx):
             problems.append(f"{pirate.name}: {pirate.config} does not parse: {problem}")
             continue  # the units are rendered from it too
         if isinstance(raw, dict):
-            for key in sorted(set(raw) & set(OLD_CONFIG_KEYS)):
+            if "client_uids" in raw:
+                problems.extend(_legacy_admission(ctx, pirate, raw["client_uids"]))
+            for key in sorted((set(raw) & set(OLD_CONFIG_KEYS)) - {"client_uids"}):
                 problems.append(f"{pirate.name}: {pirate.config}: remove {key!r} (now {OLD_CONFIG_KEYS[key]})")
             profiles = raw.get("profiles")
             for flavour, value in sorted(profiles.items() if isinstance(profiles, dict) else []):
@@ -179,19 +213,25 @@ def upgrade_problems(ctx):
 
 
 def data_generation(ctx):
-    """Pirates keep no versioned data: None. The engine asks this in its step 1, the
-    only step `deploy --check` runs, and the deploy asks it before preparing; so the
-    upgrade's shapes are reported here, all at once, before anything is written
-    (boring-deploy has no other step-1 hook yet)."""
-    import boring_deploy
-    problems = upgrade_problems(ctx)
-    if problems:
-        for line in problems:
-            ctx.log(line)
-        raise boring_deploy.Failure(
-            f"{len(problems)} thing{'s' if len(problems) > 1 else ''} to change first; nothing is changed",
-            "make each change as the CHANGELOG's Upgrade notes say, then deploy --check again")
+    """Pirates keep no versioned data; upgrade diagnostics belong to preflight."""
     return None
+
+
+def _registration_clients():
+    """Live socket owners are probe candidates, never an admission roster."""
+    import glob
+    import os
+    import pwd
+    import stat
+    accounts = set()
+    for path in glob.glob(REGISTER_GLOB):
+        try:
+            info = os.lstat(path)
+            if stat.S_ISSOCK(info.st_mode) and info.st_uid > 0 and stat.S_IMODE(info.st_mode) == 0o660:
+                accounts.add(pwd.getpwuid(info.st_uid).pw_name)
+        except (OSError, KeyError):
+            continue
+    return sorted(accounts)
 
 
 def check(ctx):
@@ -201,8 +241,19 @@ def check(ctx):
     history and file roots are read, no file root may reach the key's directory, the
     history, the state or /run/credentials, and the key must be there and not empty.
     The running Pirate is not touched."""
+    import boring_deploy
+    found, problems = _all(ctx), []
+    for pirate in found:
+        try:
+            raw = json.loads(pirate.config.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raw = None  # The runtime parser below owns all other configuration errors.
+        if isinstance(raw, dict) and "client_uids" in raw:
+            problems.extend(_legacy_admission(ctx, pirate, raw["client_uids"]))
+    if problems:
+        raise boring_deploy.Failure("\n".join(problems))
     python = str(ctx.new / "app" / "bin" / "python3")
-    for pirate in _all(ctx):
+    for pirate in found:
         # The Pirate unit's identity, groups, working directory and key. Not its
         # StateDirectory= or RuntimeDirectory=: on a unit of its own systemd would
         # apply that unit's mode to the live state directory, and remove the live
@@ -217,7 +268,7 @@ def check(ctx):
                 properties.append(f"{name}={value}")
         properties += [f"LoadCredential={credential}" for credential in _credentials(ctx, pirate)]
         properties += ["NoNewPrivileges=yes", "PrivateTmp=yes", "ProtectSystem=strict", "ProtectHome=read-only"]
-        command = ["systemd-run", "--wait", "--pipe", "--quiet", "--collect",
+        command = ["systemd-run", "--wait", "--pipe", "--collect",
                    *(part for value in properties for part in ("-p", value)),
                    python, "-I", "-m", "boring_pirates.common.ipc", "check-config", "--config", str(pirate.config)]
         result = ctx.run(*command, check=False)
@@ -227,19 +278,18 @@ def check(ctx):
             report = {"ok": False, "error": (result.stderr or result.stdout).strip()[-400:]}
         if result.returncode != 0 or report.get("ok") is not True:
             import boring_deploy
-            raise boring_deploy.Failure(f"{pirate.name}: configuration refused: {report.get('error')}")
+            reason = (str(report.get("error") or "").strip() or result.stderr.strip()
+                      or f"systemd-run exited {result.returncode} without a configuration result")
+            raise boring_deploy.Failure(f"{pirate.name}: configuration refused: {reason}")
         ctx.log(f"{pirate.name}: configuration parses; key {report['credential']}; "
                 f"active flavours: {', '.join(sorted(report['flavours']))}")
     plan_units(ctx)
 
 
 def smoke(ctx):
-    """Every active flavour of every running Pirate answers its ping through that
-    Pirate's socket, asked as one of its clients (the Pond workers; root is not a
-    client). A Pirate the switch left stopped (ctx.stopped) is not pinged; with
-    all stopped the engine skips the smoke, and so does this.
-    A unit is active before its socket exists: wait for it, up to a minute."""
-    import pwd
+    """Ping active flavours as live worker identities; only runtime admission
+    can make a ping succeed. Stopped Pirates remain stopped. Allow a minute
+    for restart and registration, without creating or remembering a UID grant."""
     import time
     import boring_deploy
     pirate_command = str(ctx.home / "current" / "bin" / "boring-pirate")
@@ -255,18 +305,30 @@ def smoke(ctx):
         return
     for pirate in running:
         raw = json.loads(pirate.config.read_text())
-        client = pwd.getpwuid(raw["client_uids"][0]).pw_name
         flavours = sorted(n for n, p in raw["profiles"].items() if p.get("active"))
         listening = socket(ctx, pirate)
+        clients = _registration_clients()
+        if not clients:
+            raise boring_deploy.Failure(f"{pirate.name}: no live Pond registration socket; cannot smoke-test",
+                                       "start an admitted Pond, then deploy again")
+        answered = set()
         for flavour in flavours:
             while True:
-                answer = ctx.run(pirate_command, "ping", "--socket", str(listening), "--flavour", flavour,
-                                 user=client, check=False)
-                if answer.returncode == 0:
-                    break
-                if time.monotonic() > deadline:
-                    raise boring_deploy.Failure(f"{pirate.name}: flavour {flavour} does not answer: "
-                                                f"{answer.stderr.strip()[-300:]}",
-                                                f"journalctl -u {pirate.unit} -n 50")
-                time.sleep(2)
-        ctx.log(f"{pirate.name}: {len(flavours)} flavours answer {client}: {', '.join(flavours)}")
+                errors = []
+                for client in clients:
+                    answer = ctx.run(pirate_command, "ping", "--socket", str(listening), "--flavour", flavour,
+                                     user=client, check=False)
+                    if answer.returncode == 0:
+                        answered.add(client)
+                        break
+                    errors.append(f"{client}: {(answer.stderr or answer.stdout).strip()[-300:]}")
+                else:
+                    if time.monotonic() > deadline:
+                        raise boring_deploy.Failure(f"{pirate.name}: flavour {flavour} has no accepted worker: "
+                                                   + "; ".join(errors),
+                                                   f"journalctl -u {pirate.unit} -n 50; check description admission")
+                    time.sleep(2)
+                    clients = _registration_clients()
+                    continue
+                break
+        ctx.log(f"{pirate.name}: {len(flavours)} flavours answer {', '.join(sorted(answered))}: {', '.join(flavours)}")

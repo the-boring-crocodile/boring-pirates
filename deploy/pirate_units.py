@@ -100,10 +100,12 @@ def digest(text):
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def write_record(name, hashes, version, account, groups):
+def write_record(name, hashes, version, account, groups, *, retained_account=None):
     """rendered.json: the Pirate's account and groups (install's choices), and which
     unit bytes the deploy (or install) may replace next time."""
     document = {"release": version, "account": account, "groups": list(groups), "units": dict(sorted(hashes.items()))}
+    if retained_account is not None:
+        document["retained_account"] = retained_account
     write(CONFIG_DIR / name / RECORD, json.dumps(document, indent=2) + "\n", 0o644)
 
 
@@ -133,6 +135,11 @@ def read_record(name):
         _refuse(f"{path}: account", account, "an account name install accepts")
     if not isinstance(groups, list) or not all(isinstance(g, str) and re.fullmatch(GROUP_PATTERN, g) for g in groups):
         _refuse(f"{path}: groups", groups, "a list of group names")
+    retained = raw.get("retained_account")
+    if retained is not None and (not isinstance(retained, dict) or set(retained) != {"uid", "home"}
+            or type(retained["uid"]) is not int or retained["uid"] <= 0
+            or not isinstance(retained["home"], str) or not Path(retained["home"]).is_absolute()):
+        raise _failure(f"{path}: invalid retained account identity")
     return raw
 
 

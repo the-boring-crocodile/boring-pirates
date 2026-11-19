@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import ctypes
 import glob
+from importlib.metadata import version as distribution_version
 import hashlib
 import json
 import logging
@@ -20,6 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from boring_registry import Watchdog
+from boring_outcomes import Refused, Failed
+from .outcomes import failure_data
 
 from . import assignment, history
 from .history import JOB_ID, FileHistory
@@ -39,14 +42,14 @@ REGISTER_GLOB = "/run/boring-crocodile/guests/*/register.sock"
 SCAN_SECONDS = 3.0
 PRUNE_SECONDS = 3600.0
 CLIENT_TIMEOUT = 5.0
-REQUIRED = {"provider", "checkout", "client_uids", "descriptor_file",
-            "default_timeout_seconds", "max_timeout_seconds", "retention_seconds", "profiles"}
+REQUIRED = {"provider", "checkout", "descriptor_file",
+            "default_timeout_seconds", "max_timeout_seconds", "retention_seconds", "profiles", "service_authority"}
 SOCKET_NAME = "pirate.sock"  # in the unit's RuntimeDirectory= (deploy/steps.py pings it there)
-OPTIONAL = {"provider_request_timeout_seconds", "provider_idle_timeout_seconds", "execution", "service_authority",
+OPTIONAL = {"provider_request_timeout_seconds", "provider_idle_timeout_seconds", "execution",
             "provider_endpoint", "caps"}
 SHAPES = {"ping": {"operation", "flavour"}, "describe": {"operation", "flavour"},
           "run": {"operation", "flavour", "job_id", "assignment", "timeout_seconds"}}
-OPTIONAL_FIELDS = {"run": {"overrides"}}  # PF1; an older Pirate refuses the field (exact shapes)
+OPTIONAL_FIELDS = {"run": {"overrides"}}
 DESCRIPTOR = {"id", "name", "description", "capabilities", "workspace_scope"}
 log = logging.getLogger("boring_pirates")
 
@@ -58,7 +61,6 @@ class Config:
     checkout: Path
     history_dir: Path
     key_file: Path | None  # None only for check-config outside the unit
-    client_uids: frozenset[int]
     descriptor: dict
     default_timeout: float
     max_timeout: float
@@ -113,9 +115,6 @@ def settings(path: Path, *, environment: Mapping[str, str] | None = None, creden
     info = os.lstat(history_dir)
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
         raise PermissionError("the state directory must be a private directory owned by the Pirate")
-    uids = raw["client_uids"]
-    if not isinstance(uids, list) or not uids or any(type(uid) is not int or uid < 1 for uid in uids):
-        raise ValueError("client_uids must be a nonempty list of positive UIDs")
     default_timeout = positive_seconds(raw["default_timeout_seconds"], "default_timeout_seconds")
     max_timeout = positive_seconds(raw["max_timeout_seconds"], "max_timeout_seconds")
     if default_timeout > max_timeout:
@@ -143,25 +142,27 @@ def settings(path: Path, *, environment: Mapping[str, str] | None = None, creden
                                     "provider_idle_timeout_seconds")
     if idle_timeout > request_timeout:
         raise ValueError("provider_idle_timeout_seconds exceeds provider_request_timeout_seconds")
-    return Config(raw["provider"], socket, checkout, history_dir, key_file, frozenset(uids), descriptor,
+    return Config(raw["provider"], socket, checkout, history_dir, key_file, descriptor,
                   default_timeout, max_timeout, retention, request_timeout,
                   parse_profiles(raw["profiles"], checkout, raw["provider"], protected=protected), execution, authority,
                   endpoint, idle_timeout, Caps.parse(raw.get("caps")))
 
 
 def refusal(code: str, message: str) -> dict:
-    return {"ok": False, "error": {"code": code, "message": message}}
+    return {"ok": False, "outcome": Refused(code, message).as_data()}
 
 
 def encode(message: dict) -> bytes:
     return (json.dumps(message, allow_nan=False, ensure_ascii=True, separators=(",", ":")) + "\n").encode()
 
 
-async def exchange(path: Path, payload: dict, timeout: float | None = CLIENT_TIMEOUT) -> dict:
+async def exchange(path: Path, payload: dict, timeout: float | None = CLIENT_TIMEOUT, *, expected_uid: int | None = None) -> dict:
     """One request, one response envelope (returned as data, whatever it says)."""
     async def go() -> dict:
         reader, writer = await asyncio.open_unix_connection(path, limit=MAX_FRAME)
         try:
+            if expected_uid is not None and peer_uid(writer) != expected_uid:
+                raise Refused("forbidden", "registration socket peer UID differs from the controller vouch")
             writer.write(encode(payload))
             await writer.drain()
             return decode_object(await reader.readline())
@@ -190,6 +191,9 @@ class Pirate:
         self.stopping = False  # set by serve_instance before it cancels the running assignments
         # register socket -> (its owner uid, one watchdog per flavour, their tasks)
         self.ponds: dict[str, tuple[int, dict[str, Watchdog], list[asyncio.Task]]] = {}
+        self.accepted = {}  # (socket, flavour) -> unchanged live socket identity
+        self.observed = {}
+        self.registration_tasks = set()
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         task = asyncio.current_task()
@@ -207,12 +211,13 @@ class Pirate:
             response = await self.answer(reader, writer)
         except Exception as error:
             log.exception("request failed")
-            response = {"ok": False, "failure": f"{type(error).__name__}: {error}"}
+            response = {"ok": False, "outcome": failure_data(error, log_error=False)}
         try:
             if response is not None:
                 data = encode(response)
                 if len(data) > MAX_FRAME:
-                    data = encode({"ok": False, "failure": "response exceeds frame limit"})
+                    data = encode({"ok": False, "outcome": Failed("limit", "response exceeds frame limit",
+                                                               component="pirate", effects="unknown").as_data()})
                 writer.write(data)
                 await writer.drain()
         except ConnectionError:
@@ -224,8 +229,8 @@ class Pirate:
 
     async def answer(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> dict | None:
         uid = peer_uid(writer)
-        if uid not in self.config.client_uids:
-            return refusal("forbidden", f"uid {uid} is not a client of this Pirate")
+        if not self.has_client(uid):
+            return refusal("forbidden", f"uid {uid} has no accepted live registration")
         try:
             request = decode_object(await reader.readline())
         except ValueError as error:
@@ -237,6 +242,10 @@ class Pirate:
                            "(run: and optionally overrides)")
         if not isinstance(name, str) or name not in self.flavours:
             return refusal("not_found", f"no active flavour {name!r}")
+        try:
+            await self.authorize(uid, name)
+        except (Refused, Failed) as error:
+            return {"ok": False, "outcome": error.as_data()}
         if operation == "ping":
             # Each Pond's worker runs as its own uid, the owner of its register.sock.
             # One watchdog per (register socket, flavour) has one source: that worker.
@@ -338,46 +347,127 @@ class Pirate:
         finally:
             transcript.close()
 
+    @staticmethod
+    def socket_identity(path):
+        info = os.lstat(path)
+        if not stat.S_ISSOCK(info.st_mode) or info.st_uid <= 0 or stat.S_IMODE(info.st_mode) != 0o660:
+            raise PermissionError("registration must be a non-root socket with mode 0660")
+        return info.st_dev, info.st_ino, info.st_uid, info.st_ctime_ns
+
+    def forget(self, path):
+        for key in list(self.accepted):
+            if key[0] == path:
+                del self.accepted[key]
+
+    def has_client(self, uid):
+        for (path, _), identity in list(self.accepted.items()):
+            try:
+                unchanged = self.socket_identity(path) == identity
+            except OSError:
+                unchanged = False
+            if not unchanged:
+                self.forget(path)
+        return any(identity[2] == uid for identity in self.accepted.values())
+
+    async def vouch(self, path, identity):
+        authority = self.config.service_authority
+        if authority is None:
+            raise Refused("unavailable", "Crocodile authority is not configured")
+        try:
+            proof = await authority.request("registration", pond=Path(path).parent.name)
+        except PermissionError as error:
+            raise Refused("forbidden", "cannot verify the Crocodile authority identity") from error
+        except (OSError, asyncio.TimeoutError) as error:
+            raise Refused("unavailable", "Crocodile authority is unavailable") from error
+        if (proof.get("pond") != Path(path).parent.name or proof.get("socket_path") != path
+                or type(proof.get("uid")) is not int or proof["uid"] != identity[2]
+                or not isinstance(proof.get("pirate"), str) or not proof["pirate"]):
+            raise Refused("forbidden", "Crocodile did not vouch for this registration socket")
+        return proof
+
+    async def authorize(self, uid, flavour):
+        for (path, name), identity in list(self.accepted.items()):
+            if name == flavour and identity[2] == uid:
+                try:
+                    await self.vouch(path, identity)
+                    if self.socket_identity(path) != identity:
+                        raise Refused("forbidden", "registration socket changed")
+                except OSError as error:
+                    self.forget(path)
+                    raise Refused("forbidden", "registration socket is no longer valid") from error
+                except BaseException:
+                    self.forget(path)
+                    raise
+                return
+        raise Refused("forbidden", "worker has no accepted registration for this flavour")
+
     def scan(self) -> None:
-        """Register where a Pond's register.sock is owned by a client uid."""
+        """Discover sockets; a controller vouch and accepted reply grant trust."""
         found = {}
         for path in glob.glob(self.register_glob):
             with suppress(OSError):
-                info = os.lstat(path)
-                if stat.S_ISSOCK(info.st_mode) and info.st_uid in self.config.client_uids:
-                    found[path] = info.st_uid
-        for path, (owner, _, tasks) in list(self.ponds.items()):
-            if found.get(path) != owner:
+                found[path] = self.socket_identity(path)
+        for path, (_, _, tasks) in list(self.ponds.items()):
+            if found.get(path) != self.observed.get(path):
+                self.forget(path)
                 for task in tasks:
                     task.cancel()
                 del self.ponds[path]
+                self.observed.pop(path, None)
                 log.info("stopped registering at %s", path)
-        for path, owner in found.items():
+        for path, identity in found.items():
             if path not in self.ponds:
-                watchdogs = {name: Watchdog(self.registrar(path, name)) for name in self.flavours}
-                self.ponds[path] = (owner, watchdogs, [asyncio.create_task(w.run()) for w in watchdogs.values()])
+                watchdogs = {name: Watchdog(self.registrar(path, name, identity)) for name in self.flavours}
+                tasks = [asyncio.create_task(w.run()) for w in watchdogs.values()]
+                self.registration_tasks.update(tasks)
+                for task in tasks:
+                    task.add_done_callback(self.registration_tasks.discard)
+                self.observed[path] = identity
+                self.ponds[path] = (identity[2], watchdogs, tasks)
                 log.info("registering %s at %s", ", ".join(watchdogs), path)
 
-    def registrar(self, path: str, name: str):
+    def registrar(self, path: str, name: str, expected_identity=None):
         last = "unknown"
 
         async def register() -> dict | None:
-            """The ack for the watchdog, or None. The Pirate keeps only the interval: each
-            watchdog serves one register socket, so one implicit source."""
             nonlocal last
             ack = None
             try:
-                reply = await exchange(Path(path), {"operation": "register", "kind": "pirate", "flavour": name,
-                                                    "socket_path": str(self.config.socket)})
-                if reply.get("ok") is True:
-                    ack = {"ping_interval_seconds": positive_seconds(reply["result"]["ping_interval_seconds"],
-                                                                     "ping_interval_seconds")}
+                identity = expected_identity or self.socket_identity(path)
+                if self.socket_identity(path) != identity:
+                    raise Refused("forbidden", "registration socket changed")
+                proof = await self.vouch(path, identity)
+                reply = await exchange(Path(path), {
+                    "operation": "register", "kind": "pirate", "flavour": name,
+                    "socket_path": str(self.config.socket), "version": distribution_version("boring-pirates")},
+                    expected_uid=identity[2])
+                if reply.get("ok") is True and set(reply) == {"ok", "result"}:
+                    result = reply["result"]
+                    if (not isinstance(result, dict) or result.get("accepted") is not True
+                            or result.get("pond") != proof["pond"] or result.get("pirate") != proof["pirate"]):
+                        raise ValueError("registration reply did not accept this Pirate/Pond pair")
+                    interval = positive_seconds(result["ping_interval_seconds"], "ping_interval_seconds")
+                    if self.socket_identity(path) != identity:
+                        raise Refused("forbidden", "registration socket changed while registering")
+                    self.accepted[(path, name)] = identity
+                    ack = {"ping_interval_seconds": interval}
                     note = "registered"
                 else:
-                    note = f"refused: {reply.get('error', reply.get('failure'))}"
-            except Exception as error:  # unreachable or malformed; the watchdog tries again
+                    data = reply.get("outcome")
+                    if reply.get("ok") is not False or set(reply) != {"ok", "outcome"} or not isinstance(data, dict):
+                        raise ValueError("invalid registration response envelope")
+                    cls = {"refused": Refused, "failed": Failed}.get(data.get("status"))
+                    if cls is None:
+                        raise ValueError("invalid registration outcome status")
+                    raise cls(data.get("code"), data.get("message"), **{
+                        k: v for k, v in data.items() if k not in ("status", "code", "message")})
+            except (Refused, Failed) as error:
+                note = f"{error.status}: {error}"
+            except Exception as error:
                 note = f"failed: {type(error).__name__}: {error}"
-            if note != last:  # report changes, not every retry
+            if ack is None:
+                self.accepted.pop((path, name), None)
+            if note != last:
                 log.log(logging.INFO if ack else logging.WARNING, "flavour %s at %s: %s", name, path, note)
                 last = note
             return ack
@@ -389,10 +479,13 @@ class Pirate:
                 self.scan()
                 await asyncio.sleep(SCAN_SECONDS)
         finally:
-            tasks = [task for _, _, group in self.ponds.values() for task in group]
+            self.accepted.clear()
+            tasks = list(self.registration_tasks)
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            self.ponds.clear()
+            self.observed.clear()
 
     async def keep_pruned(self) -> None:
         while True:

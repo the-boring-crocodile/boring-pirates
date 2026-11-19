@@ -140,7 +140,7 @@ class CardTest(base.SocketCase):
             await inspect_flavours(self.parrot, Folder, None)
         self.assertEqual(sorted(self.parrot.flavours), ["beta"])
         self.assertIn("flavour alpha is not offered", logs.output[0])
-        self.assertEqual((await self.ask("ping", "alpha"))["error"]["code"], "not_found")
+        self.assertEqual((await self.ask("ping", "alpha"))["outcome"]["code"], "not_found")
         described = (await self.ask("describe", "beta"))["result"]["profile"]["mistral"]
         self.assertEqual((described["max_tokens"], described["model_card"]["max_context_length"]), (8192, 131072))
 

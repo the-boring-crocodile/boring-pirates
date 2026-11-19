@@ -158,7 +158,7 @@ class SharedToolTest(ToolCase):
         runtime = ToolRuntime(authority=authority)
         self.assertIsNone(runtime.services)  # the caller is known with the first token
         self.addAsyncCleanup(runtime.close)
-        call = AsyncMock(side_effect=ServiceFailure({'status':'failed','effects':'unknown','message':'lost'}))
+        call = AsyncMock(side_effect=ServiceFailure({'status':'failed','code':'tool_error','effects':'unknown','message':'lost'}))
         with patch.object(Services, 'call', call):
             result = await self.run_script(Script(
                 tool_call('1','service_list'),
@@ -173,9 +173,11 @@ class SharedToolTest(ToolCase):
         self.assertEqual(runtime.services.pond, 'pirate/parrot')  # set once; another caller is a failure
         outcomes=[x['data'] for x in self.trail() if x['kind']=='tool_result']
         self.assertEqual([x['name'] for x in outcomes[0]['value']['services']], ['canvas'])
-        self.assertEqual(outcomes[1]['status'], 'refused')
+        self.assertEqual(outcomes[1]['refusal']['status'], 'refused')
         self.assertEqual(outcomes[2]['failure']['effects'], 'unknown')
-        self.assertIn("caller 'pirate/other'", outcomes[3]['error'])
+        self.assertEqual(outcomes[3]['failure']['message'],
+                         "RuntimeError: The Pirate failed; see its log for details.")
+        self.assertNotIn("caller 'pirate/other'", json.dumps(result))
         self.assertEqual(result['tool_errors_count'], 3)
 
     async def test_service_call_takes_file_references_and_save_to(self):
@@ -206,7 +208,7 @@ class SharedToolTest(ToolCase):
         self.assertEqual(authority.request.await_count, 2)  # a token only right before a call is sent
         outcomes = [x['data'] for x in self.trail() if x['kind'] == 'tool_result']
         self.assertEqual(outcomes[1]['value']['saved_to']['path'], 'answer.txt')
-        self.assertEqual([outcomes[2]['status'], outcomes[3]['status']], ['refused', 'refused'])
+        self.assertEqual([outcomes[2]['refusal']['status'], outcomes[3]['refusal']['status']], ['refused', 'refused'])
         self.assertEqual(result['tool_errors_count'], 2)
         # The saved answer counts as a write: write actions, reminders and the FILES check see it.
         self.assertEqual([w['path'] for w in result['write_actions']], ['answer.txt'])
@@ -240,7 +242,7 @@ class SharedToolTest(ToolCase):
         outcomes = [x['data'] for x in self.trail() if x['kind'] == 'tool_result']
         first, second = outcomes
         self.assertFalse(first['ok'])
-        self.assertEqual((first['code'], first['failure']['effects']), ('save_to_failed', 'unknown'))
+        self.assertEqual((first['failure']['code'], first['failure']['effects']), ('save_to_failed', 'unknown'))
         self.assertEqual(first['value']['content'], [{'type': 'text', 'text': 'drawn'}])  # the answer is kept
         self.assertEqual(second['status'], 'not_started')
         self.assertFalse((self.config.checkout / 'after.txt').exists())
@@ -298,7 +300,7 @@ class SharedToolTest(ToolCase):
                           save_to={'root': 'work', 'path': 'o.txt', 'expected_sha256': None}),
                 answer('done')), runtime, spec=spec, timeout=30)
         outcomes = [x['data'] for x in self.trail() if x['kind'] == 'tool_result']
-        self.assertEqual([o.get('code') for o in outcomes], ['forbidden', 'forbidden'])
+        self.assertEqual([o['refusal']['code'] for o in outcomes], ['forbidden', 'forbidden'])
         call.assert_not_awaited()
         authority.request.assert_not_awaited()  # refused before any token
         self.assertFalse((self.config.checkout / 'o.txt').exists())
@@ -345,6 +347,35 @@ class ViewImageTest(ToolCase):
         self.assertIn('only the latest image', json.dumps(final))
         tool_records = [r['data'] for r in self.trail() if r['kind'] == 'tool_result']
         self.assertNotIn('base64,', json.dumps(tool_records))  # the transcript keeps no image bytes
+
+    async def test_second_image_in_one_turn_refuses_before_read_and_success_receipt(self):
+        (self.config.checkout / 'one.png').write_bytes(png(3, 2))
+        (self.config.checkout / 'two.png').write_bytes(png(5, 4))
+        seen = []
+        class Watching(Script):
+            async def complete(self, messages):
+                seen.append([dict(m) for m in messages])
+                return await super().complete(messages)
+        first = tool_call('one', 'view_image', root='work', path='one.png')
+        second = tool_call('two', 'view_image', root='work', path='two.png')
+        turn = replace(first, calls=[*first.calls, *second.calls])
+        from boring_pirates.common import assignment
+        original = assignment.read_image
+        with patch.object(assignment, 'read_image', wraps=original) as read:
+            result = await self.run_script(Watching(turn, answer('looked')),
+                                           spec=replace(self.spec, tools=self.spec.tools | {'view_image'}))
+        self.assertEqual(result['state'], 'completed')
+        self.assertEqual(read.await_count, 1)
+        receipts = [r['data'] for r in self.trail() if r['kind'] == 'tool_result']
+        self.assertTrue(receipts[0]['ok'])
+        self.assertTrue(receipts[0]['value']['attached'])
+        self.assertFalse(receipts[1]['ok'])
+        self.assertEqual(receipts[1]['refusal']['code'], 'limit')
+        self.assertNotIn('value', receipts[1])
+        attached = [p for m in seen[1] if isinstance(m.get('content'), list)
+                    for p in m['content'] if p['type'] == 'image_url']
+        self.assertEqual(len(attached), 1)
+        self.assertTrue(attached[0]['image_url'].endswith(base64.b64encode(png(3, 2)).decode('ascii')))
 
     async def test_not_offered_unless_configured_and_limits_hold(self):
         from boring_pirates.common import images
