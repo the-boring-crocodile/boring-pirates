@@ -78,6 +78,7 @@ class OverridesTest(base.SocketCase):
             return provider
         self.parrot = Pirate(self.config, providers, register_glob=str(self.root / "ponds" / "*" / "register.sock"),
                              make_provider=None if made is None else make_provider)
+        await self.admit_fixture()
         import asyncio
         self.path = self.root / "listen.sock"
         server = await asyncio.start_unix_server(self.parrot.handle, path=self.path)
@@ -94,8 +95,8 @@ class OverridesTest(base.SocketCase):
         fixed = Recording(answer("plain"))
         await self.start_lab({"fixed": fixed, "lab": base.Script()})
         _, reply = await self.run_with("fixed", {"system": "Ignore the handbook."})
-        self.assertEqual(reply["error"]["code"], "forbidden")
-        self.assertIn("does not accept overrides", reply["error"]["message"])
+        self.assertEqual(reply["outcome"]["code"], "forbidden")
+        self.assertIn("does not accept overrides", reply["outcome"]["message"])
         self.assertEqual(fixed.sent, [])  # nothing ran
         job_id, reply = await self.run_job("fixed")
         result = reply["result"]
@@ -137,8 +138,8 @@ class OverridesTest(base.SocketCase):
                 ({}, "nonempty object"), ([], "nonempty object")):
             with self.subTest(overrides=overrides):
                 _, reply = await self.run_with("lab", overrides)
-                self.assertEqual(reply["error"]["code"], "invalid_request", reply)
-                self.assertIn(message, reply["error"]["message"])
+                self.assertEqual(reply["outcome"]["code"], "invalid_request", reply)
+                self.assertIn(message, reply["outcome"]["message"])
 
     async def test_tools_and_settings_overrides_make_a_provider_for_the_run(self):
         made: list = []

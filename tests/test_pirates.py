@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+from importlib.metadata import version as distribution_version
+from registration_fixture import FixtureAuthority, register_fixture
 import hashlib
 import json
 import os
@@ -22,7 +25,7 @@ from boring_pirates.common.profiles import default_files
 from boring_pirates.common.history import FileHistory, prune
 from boring_pirates.common.ipc import Pirate, exchange, settings
 from boring_pirates.common.runtime import ToolRuntime
-from boring_worker_kit.outcomes import Refusal
+from boring_worker_kit.outcomes import Refused
 from boring_pirates.common.providers import Turn
 from boring_pirates.mistral import provider as mistral
 from boring_pirates.mistral.provider import MistralProvider
@@ -137,7 +140,8 @@ def make_site(root: Path, profiles=None, **overrides) -> Path:
         "id": "parrot", "name": "Parrot", "description": "test", "capabilities": [], "workspace_scope": "work"}))
     config = {
         "provider": "mistral", "checkout": str(root / "checkout"),
-        "client_uids": [UID], "descriptor_file": str(root / "context" / "descriptor.json"),
+        "descriptor_file": str(root / "context" / "descriptor.json"),
+        "service_authority": {"socket": str(root / "authority.sock"), "uid": UID},
         "default_timeout_seconds": 5, "max_timeout_seconds": 10, "retention_seconds": 60,
         "profiles": profiles if profiles is not None else {
             "alpha": {"active": True, "model": "model-a", "allowed_tools": ALL_TOOLS,
@@ -312,7 +316,7 @@ class ConfigTest(TempCase):
         for name, path in (("file_read", relative + "/context/key"), ("file_list", relative + "/history"),
                            ("file_read_bytes", f"proc/{pid}/mem"), ("file_read", f"proc/{pid}/environ"),
                            ("file_list", "run/credentials"), ("file_list", "sys/kernel"), ("file_read", "dev/null")):
-            with self.subTest(path=path), self.assertRaises(Refusal) as refused:
+            with self.subTest(path=path), self.assertRaises(Refused) as refused:
                 await call(name, path=path)
             self.assertEqual(refused.exception.code, "forbidden")
 
@@ -331,13 +335,24 @@ class ConfigTest(TempCase):
 
 
 class SocketCase(TempCase):
+    register_initial = True
     async def start(self, providers, **overrides):
         self.config = settings(make_site(self.root, **overrides))
         self.parrot = Pirate(self.config, providers, register_glob=str(self.root / "ponds" / "*" / "register.sock"))
+        self.authority = FixtureAuthority(self.root)
+        self.parrot.config = replace(self.config, service_authority=self.authority)
+        if self.register_initial:
+            await self.admit_fixture()
         self.path = self.root / "listen.sock"
         server = await asyncio.start_unix_server(self.parrot.handle, path=self.path)
         await server.__aenter__()
         self.addAsyncCleanup(server.__aexit__, None, None, None)
+
+    async def admit_fixture(self):
+        server = await register_fixture(self.root, self.parrot)
+        self.authority = self.parrot.config.service_authority
+        self.addAsyncCleanup(server.wait_closed)
+        self.addCleanup(server.close)
 
     async def ask(self, operation, flavour, **arguments):
         return await exchange(self.path, {"operation": operation, "flavour": flavour, **arguments}, None)
@@ -377,8 +392,8 @@ class ProtocolTest(SocketCase):
         for operation in ("ping", "describe"):
             for flavour in ("gamma", "nope", 3):
                 reply = await self.ask(operation, flavour)
-                self.assertEqual(reply["error"]["code"], "not_found", (operation, flavour))
-        self.assertEqual((await self.run_job("gamma"))[1]["error"]["code"], "not_found")
+                self.assertEqual(reply["outcome"]["code"], "not_found", (operation, flavour))
+        self.assertEqual((await self.run_job("gamma"))[1]["outcome"]["code"], "not_found")
 
     async def test_invalid_requests_are_refusals(self):
         await self.start({"alpha": Script(answer("still here")), "beta": Script()})
@@ -400,14 +415,15 @@ class ProtocolTest(SocketCase):
                 await writer.drain()
                 reply = json.loads(await asyncio.wait_for(reader.readline(), 2))
                 writer.close()
-                self.assertEqual(reply["error"]["code"], "invalid_request")
+                self.assertEqual(reply["outcome"]["code"], "invalid_request")
         self.assertEqual(list((self.root / "history").iterdir()), [])
         self.assertEqual((await self.run_job("alpha"))[1]["result"]["answer"], "still here")
 
     async def test_peer_uid_must_be_a_client(self):
-        await self.start({"alpha": Script(), "beta": Script()}, client_uids=[UID + 1])
+        await self.start({"alpha": Script(), "beta": Script()})
+        self.authority.allowed.clear()
         reply = await self.ask("ping", "alpha")
-        self.assertEqual(reply["error"]["code"], "forbidden")
+        self.assertEqual(reply["outcome"]["code"], "forbidden")
 
     async def test_busy_per_flavour_while_other_flavour_runs(self):
         gate = asyncio.Event()
@@ -416,7 +432,7 @@ class ProtocolTest(SocketCase):
         first = asyncio.create_task(self.run_job("alpha"))
         await asyncio.wait_for(alpha.started.wait(), 2)
         busy_job, busy = await self.run_job("alpha")
-        self.assertEqual(busy["error"]["code"], "busy")
+        self.assertEqual(busy["outcome"]["code"], "busy")
         self.assertFalse((self.root / "history" / (busy_job + ".jsonl")).exists())
         self.assertEqual((await self.run_job("beta"))[1]["result"]["answer"], "beta done")
         self.assertFalse(first.done())
@@ -447,11 +463,22 @@ class ProtocolTest(SocketCase):
         alpha.gate, alpha.turns = None, [answer("again")]
         self.assertEqual((await self.run_job("alpha"))[1]["result"]["answer"], "again")
 
+    async def test_typed_failure_keeps_its_cause_and_json_details_on_the_socket(self):
+        from boring_outcomes import Failed
+        await self.start({"alpha": Script(), "beta": Script()})
+        data = {"status": "failed", "code": "upstream_error", "message": "typed failure",
+                "vendor_code": "VENDOR", "nested": {"retry": [1, None]}}
+        with patch.object(self.parrot, "execute", side_effect=Failed(
+                "upstream_error", "typed failure", vendor_code="VENDOR", nested={"retry": [1, None]})), \
+                self.assertLogs("boring_pirates", "ERROR"):
+            _, reply = await self.run_job("alpha")
+        self.assertEqual(reply, {"ok": False, "outcome": data})
+
     async def test_provider_failure_is_a_failure_and_transcribed(self):
         await self.start({"alpha": Script(RuntimeError("synthetic outage")), "beta": Script()})
         with self.assertLogs("boring_pirates", "ERROR"):
             job_id, reply = await self.run_job("alpha")
-        self.assertEqual(reply, {"ok": False, "failure": "RuntimeError: synthetic outage"})
+        self.assertEqual(reply, {"ok": False, "outcome": {"status": "failed", "code": "pirate_failed", "message": "RuntimeError: The Pirate failed; see its log for details.", "component": "pirate", "effects": "unknown"}})
         last = records(self.root / "history" / (job_id + ".jsonl"))[-1]["data"]
         self.assertEqual((last["state"], last["reason"]), ("failed", "synthetic outage"))
         self.assertEqual(self.parrot.busy, set())
@@ -462,7 +489,7 @@ class ProtocolTest(SocketCase):
         before = (self.root / "history" / (job_id + ".jsonl")).read_bytes()
         with self.assertLogs("boring_pirates", "ERROR"):
             _, second = await self.run_job("alpha", job_id=job_id)
-        self.assertIn("FileExistsError", second["failure"])
+        self.assertIn("FileExistsError", second["outcome"]["message"])
         self.assertEqual((self.root / "history" / (job_id + ".jsonl")).read_bytes(), before)
 
     async def test_cli(self):
@@ -479,17 +506,30 @@ class ProtocolTest(SocketCase):
 
 
 class RegistrationTest(SocketCase):
+    register_initial = False
     async def fake_pond(self, name, reply):
         directory = self.root / "ponds" / name
         directory.mkdir(parents=True)
         received = []
+        self.authority.allowed.add(name)
+        if reply.get("ok") is True:
+            result = reply["result"]
+            result.setdefault("accepted", True)
+            result.setdefault("pond", name)
+            result.setdefault("pirate", "parrot")
 
         async def handle(reader, writer):
-            received.append(json.loads(await reader.readline()))
+            line = await reader.readline()
+            if not line:
+                writer.close()
+                await writer.wait_closed()
+                return
+            received.append(json.loads(line))
             writer.write(json.dumps(reply).encode() + b"\n")
             await writer.drain()
             writer.close()
         server = await asyncio.start_unix_server(handle, path=directory / "register.sock")
+        (directory / "register.sock").chmod(0o660)
         await server.__aenter__()
         self.addAsyncCleanup(server.__aexit__, None, None, None)
         return directory / "register.sock", received
@@ -507,7 +547,8 @@ class RegistrationTest(SocketCase):
         self.parrot.scan()
         await self.eventually(lambda: len(received) == 2)
         self.assertEqual(sorted(received, key=lambda m: m["flavour"]), [
-            {"operation": "register", "kind": "pirate", "flavour": f, "socket_path": str(self.root / "pirate.sock")}
+            {"operation": "register", "kind": "pirate", "flavour": f, "socket_path": str(self.root / "pirate.sock"),
+             "version": distribution_version("boring-pirates")}
             for f in ("alpha", "beta")])
         owner, watchdogs, _ = self.parrot.ponds[str(path)]
         self.assertEqual((owner, sorted(watchdogs)), (UID, ["alpha", "beta"]))
@@ -529,48 +570,54 @@ class RegistrationTest(SocketCase):
             "ping_interval_seconds": 2, "sources": ["pond", "garden"]}})
         self.assertEqual(await self.parrot.registrar(str(path), "alpha")(), {"ping_interval_seconds": 2.0})
 
-    async def test_owner_uid_must_be_a_client(self):
-        await self.start({"alpha": Script(), "beta": Script()}, client_uids=[UID + 1])
+    async def test_discovery_does_not_grant_an_unoffered_pond(self):
+        await self.start({"alpha": Script(), "beta": Script()})
         _, received = await self.fake_pond("other", {"ok": True, "result": {"ping_interval_seconds": 3}})
+        self.authority.allowed.clear()
         self.parrot.scan()
         await asyncio.sleep(0.05)
-        self.assertEqual((self.parrot.ponds, received), ({}, []))
+        self.assertEqual((self.parrot.accepted, received), ({}, []))
 
-    async def test_a_pond_added_later_after_client_uids_gains_its_worker_and_a_restart(self):
-        """The documented way to offer an installed Pirate a new Pond (after the
-        Crocodile's pirate-add): its worker's uid joins client_uids in config.json,
-        the Pirate restarts (reads config.json at start) and registers there too."""
-        site = make_site(self.root, client_uids=[UID + 1])
-        providers = {"alpha": Script(), "beta": Script()}
-        glob = str(self.root / "ponds" / "*" / "register.sock")
-        before = Pirate(settings(site), providers, register_glob=glob)
+    async def test_a_later_pond_is_admitted_without_a_pirate_restart(self):
+        await self.start({"alpha": Script(), "beta": Script()})
         path, received = await self.fake_pond("garden", {"ok": True, "result": {"ping_interval_seconds": 3}})
-        before.scan()
-        self.assertEqual(before.ponds, {})
-        raw = json.loads(site.read_text())
-        raw["client_uids"].append(UID)
-        site.write_text(json.dumps(raw))
-        before.scan()  # a running Pirate keeps the client_uids it started with
-        self.assertEqual(before.ponds, {})
-        after = Pirate(settings(site), providers, register_glob=glob)  # the restart
-        after.scan()
-        await self.eventually(lambda: len(received) == 2)
-        self.assertEqual(sorted(m["flavour"] for m in received), ["alpha", "beta"])
-        for _, _, tasks in after.ponds.values():
-            for task in tasks:
-                task.cancel()
-        self.assertEqual(list(after.ponds), [str(path)])
+        self.authority.allowed.clear()
+        register = self.parrot.registrar(str(path), "alpha")
+        self.assertIsNone(await register())
+        self.authority.allowed.add("garden")
+        self.assertIsNotNone(await register())
+        self.assertEqual(len(received), 1)
+        self.assertTrue((await self.ask("ping", "alpha"))["ok"])
+
+    async def test_failed_registration_retains_status_and_code(self):
+        await self.start({"alpha": Script(), "beta": Script()})
+        path, _ = await self.fake_pond("failed", {"ok": False, "outcome": {
+            "status": "failed", "code": "registration_failed", "message": "registry failed"}})
+        with self.assertLogs("boring_pirates", "WARNING") as logs:
+            self.assertIsNone(await self.parrot.registrar(str(path), "alpha")())
+        self.assertIn("failed: registration_failed: registry failed", logs.output[0])
+
+    async def test_malformed_registration_outcome_is_not_an_ack(self):
+        await self.start({"alpha": Script(), "beta": Script()})
+        path, _ = await self.fake_pond("malformed", {"ok": False, "outcome": {
+            "status": "refused", "code": "INVALID", "message": "bad"}})
+        with self.assertLogs("boring_pirates", "WARNING") as logs:
+            self.assertIsNone(await self.parrot.registrar(str(path), "alpha")())
+        self.assertIn("failed: ValueError", logs.output[0])
 
     async def test_refused_or_unreachable_registration_returns_none(self):
         await self.start({"alpha": Script(), "beta": Script()})
-        path, received = await self.fake_pond("refuses", {"ok": False, "error": {
-            "code": "forbidden", "message": "not a pirate"}})
+        path, received = await self.fake_pond("refuses", {"ok": False, "outcome": {
+            "status": "refused", "code": "forbidden", "message": "not a pirate"}})
         with self.assertLogs("boring_pirates", "WARNING") as logs:
             self.assertIsNone(await self.parrot.registrar(str(path), "alpha")())
         self.assertIn("forbidden", logs.output[0])
-        stale = self.root / "ponds" / "stale.sock"
+        stale = self.root / "ponds" / "stale" / "register.sock"
+        stale.parent.mkdir()
+        self.authority.allowed.add("stale")
         sock = socket.socket(socket.AF_UNIX)
         sock.bind(str(stale))
+        stale.chmod(0o660)
         sock.close()
         with self.assertLogs("boring_pirates", "WARNING") as logs:
             self.assertIsNone(await self.parrot.registrar(str(stale), "alpha")())
@@ -645,6 +692,10 @@ class AssignmentTest(TempCase):
         self.assertEqual([o["ok"] for o in outcomes], [True, False, False, False])
         self.assertNotIn("failure", outcomes[1])
         self.assertEqual(outcomes[2]["failure"]["effects"], "unknown")
+        self.assertEqual(outcomes[2]["failure"]["message"],
+                         "OSError: The Pirate failed; see its log for details.")
+        self.assertNotIn("disk gone", json.dumps(result))
+        self.assertNotIn("disk gone", json.dumps(answered))
         self.assertEqual((outcomes[3]["status"], outcomes[3]["error"]),
                          ("not_started", "not run: call 3 before it in this turn failed"))
         self.assertTrue((self.root / "checkout" / "a.txt").exists())
@@ -665,8 +716,8 @@ class AssignmentTest(TempCase):
         result = await self.run_with(script)
         tool_results = [r["data"] for r in self.trail() if r["kind"] == "tool_result"]
         self.assertEqual([r["ok"] for r in tool_results], [False, False, True, True])
-        self.assertIn("stale edit: expected hash differs", tool_results[0]["error"])
-        self.assertIn("stale edit: file is absent", tool_results[1]["error"])
+        self.assertIn("stale edit: expected hash differs", tool_results[0]["refusal"]["message"])
+        self.assertIn("stale edit: file is absent", tool_results[1]["refusal"]["message"])
         # The model is told the next step, with the current hash it already gets in the refusal.
         self.assertIn("Read it with file_read first", tool_results[0]["hint"])
         self.assertIn(hashlib.sha256(b"old").hexdigest(), tool_results[0]["hint"])
@@ -674,7 +725,7 @@ class AssignmentTest(TempCase):
         self.assertNotIn("hint", tool_results[2])
         self.assertEqual(result["write_actions_count"], 2)
         self.assertEqual(result["tool_errors_count"], 2)
-        self.assertEqual(result["tool_errors"], [{"tool": "file_write", "error": e["error"]} for e in tool_results[:2]])
+        self.assertEqual(result["tool_errors"], [{"tool": "file_write", "error": f"{e['refusal']['code']}: {e['refusal']['message']}"} for e in tool_results[:2]])
         self.assertEqual((self.root / "checkout" / "exists.txt").read_text(), "new")
         self.assertEqual((self.root / "checkout" / "absent.txt").read_text(), "created")
 
@@ -689,11 +740,11 @@ class AssignmentTest(TempCase):
         result = await self.run_with(script)
         results = [r["data"] for r in self.trail() if r["kind"] == "tool_result"]
         # The shared tools name the field that is wrong (missing or not allowed).
-        self.assertEqual(results[0]["fields"], ["file_write.arguments.expected_sha256"])
-        self.assertEqual(results[1]["error"], "ValueError: tool 'delete_file' is unknown; "
+        self.assertEqual(results[0]["refusal"]["fields"], ["file_write.arguments.expected_sha256"])
+        self.assertEqual(results[1]["refusal"]["message"], "tool 'delete_file' is unknown; "
                                               "allowed tools: file_list, file_read, file_write")
-        self.assertEqual(results[2]["fields"], ["file_list.arguments.recursive"])
-        self.assertEqual(results[3]["fields"], ["file_read.arguments.path"])
+        self.assertEqual(results[2]["refusal"]["fields"], ["file_list.arguments.recursive"])
+        self.assertEqual(results[3]["refusal"]["fields"], ["file_read.arguments.path"])
         self.assertTrue(results[4]["ok"])
         self.assertEqual(result["write_actions_count"], 1)  # strict: no silent default for expected_sha256
         self.assertEqual((self.root / "checkout" / "new.txt").read_text(), "x")
@@ -709,10 +760,10 @@ class AssignmentTest(TempCase):
                          ("completed", "Retried.", 3))
         replies = [m for m in client.requests[1]["messages"] if m.get("role") == "tool"]
         self.assertEqual([m["tool_call_id"] for m in replies], ["a", "b", "c"])
-        errors = [json.loads(m["content"])["error"] for m in replies]
-        self.assertTrue(errors[0].startswith("ValueError: tool arguments are not valid JSON: "), errors[0])
-        self.assertEqual(errors[1:], ["ValueError: tool call has no function name",
-                                      "ValueError: tool arguments must be a JSON object"])
+        errors = [json.loads(m["content"])["refusal"]["message"] for m in replies]
+        self.assertTrue(errors[0].startswith("tool arguments are not valid JSON: "), errors[0])
+        self.assertEqual(errors[1:], ["tool call has no function name",
+                                      "tool arguments must be a JSON object"])
         self.assertFalse((self.root / "checkout" / "x.txt").exists())
         # A response whose finish reason disagrees with its calls is still broken: a failure.
         broken = FakeMistral([mistral_answer("stop", calls=[("d", "file_list", {"root": "work", "path": "."})])])
@@ -747,7 +798,8 @@ class AssignmentTest(TempCase):
         self.assertEqual(len(result["tool_errors"]), assignment.MAX_TOOL_ERRORS)
         self.assertEqual(result["tool_errors"][0]["tool"], "file_read")
         self.assertIn("file does not exist", result["tool_errors"][0]["error"])
-        unknown = [r["data"] for r in self.trail() if r["kind"] == "tool_result"][-1]["error"]
+        refusal = [r["data"] for r in self.trail() if r["kind"] == "tool_result"][-1]["refusal"]
+        unknown = f"{refusal['code']}: {refusal['message']}"
         self.assertGreater(len(unknown), assignment.MAX_TOOL_ERROR_TEXT)  # the model sees it whole
         result = await self.run_with(Script(tool_call("x", "y" * 300), answer("ok")))
         self.assertEqual(result["tool_errors"], [{"tool": "y" * 64, "error": unknown[:assignment.MAX_TOOL_ERROR_TEXT]}])
@@ -768,7 +820,21 @@ class AssignmentTest(TempCase):
         empties = [answer("") for _ in range(assignment.EMPTY_TURN_RETRIES + 1)]
         result = await self.run_with(Script(*empties), max_turns=10)
         self.assertEqual((result["state"], result["answer"], result["usage"]["empty_turn_retries"]),
-                         ("completed", "", assignment.EMPTY_TURN_RETRIES))
+                         ("incomplete", "", assignment.EMPTY_TURN_RETRIES))
+        self.assertEqual(result["reason"], "empty_answer")
+
+    async def test_exhausted_empty_answers_keep_completed_write_receipts(self):
+        empties = [answer(" ") for _ in range(assignment.EMPTY_TURN_RETRIES + 1)]
+        result = await self.run_with(Script(
+            tool_call("write", "file_write", root="work", path="kept.txt",
+                      content="completed work", expected_sha256=None), *empties), max_turns=10)
+        self.assertEqual((result["state"], result["reason"]), ("incomplete", "empty_answer"))
+        self.assertEqual((self.config.checkout / "kept.txt").read_text(), "completed work")
+        self.assertEqual(result["write_actions_count"], 1)
+        self.assertEqual(result["write_actions"][0]["path"], "kept.txt")
+        receipt = next(r["data"] for r in self.trail() if r["kind"] == "tool_result")
+        self.assertTrue(receipt["ok"])
+        self.assertEqual(receipt["value"]["sha256"], result["write_actions"][0]["sha256"])
 
     async def test_service_call_budget_and_write_reminder(self):
         calls = [tool_call(str(i), "service_call", service="knowledge", tool="kb_search", arguments={}) for i in range(2)]
@@ -852,8 +918,8 @@ class AssignmentTest(TempCase):
                                                       expected_sha256=None), answer("ok")),
                                      tools=frozenset({"file_read"}))
         self.assertEqual(result["state"], "completed")
-        self.assertEqual([r for r in self.trail() if r["kind"] == "tool_result"][0]["data"]["error"],
-                         "ValueError: tool 'file_write' is disabled by profile; allowed tools: file_read")
+        self.assertEqual([r for r in self.trail() if r["kind"] == "tool_result"][0]["data"]["refusal"]["message"],
+                         "tool 'file_write' is disabled by profile; allowed tools: file_read")
         self.assertFalse((self.root / "checkout" / "x").exists())
 
     async def test_cancel_waits_for_a_file_write_in_progress(self):
@@ -975,9 +1041,9 @@ class FilesTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([e["name"] for e in (await self.call("file_list", path="."))["entries"]], ["sub"])
         receipt = await self.call("file_write", path="sub/note.txt", content="one", expected_sha256=None)
         self.assertEqual((await self.call("file_read", path="sub/note.txt"))["content"], "one")
-        with self.assertRaisesRegex(Refusal, "stale edit"):
+        with self.assertRaisesRegex(Refused, "stale edit"):
             await self.call("file_write", path="sub/note.txt", content="two", expected_sha256=None)
-        with self.assertRaisesRegex(Refusal, "stale edit"):
+        with self.assertRaisesRegex(Refused, "stale edit"):
             await self.call("file_write", path="sub/note.txt", content="two", expected_sha256="0" * 64)
         self.assertEqual((self.root / "sub" / "note.txt").read_text(), "one")  # the refusals wrote nothing
         await self.call("file_write", path="sub/note.txt", content="two", expected_sha256=receipt["sha256"])
@@ -985,9 +1051,9 @@ class FilesTest(unittest.IsolatedAsyncioTestCase):
         (self.root / "sub" / "link").symlink_to("/etc/passwd")
         (self.root / "sub" / "dirlink").symlink_to("/etc")
         for name in ("../escape", ".git/config", "sub/link", "sub/dirlink/passwd"):
-            with self.subTest(name=name), self.assertRaises((Refusal, ValueError, OSError)):
+            with self.subTest(name=name), self.assertRaises((Refused, ValueError, OSError)):
                 await self.call("file_read", path=name)
-        with self.assertRaises((Refusal, ValueError, OSError)):
+        with self.assertRaises((Refused, ValueError, OSError)):
             await self.call("file_write", path="sub/link", content="bad", expected_sha256=None)
         self.assertTrue((self.root / "sub" / "link").is_symlink())
         self.assertEqual(os.readlink(self.root / "sub" / "link"), "/etc/passwd")
@@ -996,16 +1062,16 @@ class FilesTest(unittest.IsolatedAsyncioTestCase):
         # The model gets a sentence, not "[Errno 40] ...".
         (self.root / "sub" / "link").symlink_to("/etc/passwd")
         (self.root / "sub" / "f").write_text("x")
-        cases = (("sub/missing", "file does not exist"), ("sub/link", "not an allowed regular file"),
-                 ("sub/f/x", "not a directory"), ("sub", "not an allowed regular file"),
+        cases = (("sub/missing", "file does not exist"), ("sub/link", "do not follow links"),
+                 ("sub/f/x", "not a directory"), ("sub", "use file_list"),
                  ("a" * 256, "too long"))
         for path, text in cases:
-            with self.subTest(path=path), self.assertRaisesRegex(Refusal, text):
+            with self.subTest(path=path), self.assertRaisesRegex(Refused, text):
                 await self.call("file_read", path=path)
         (self.root / "sub" / "bin").write_bytes(b"\xff")
-        with self.assertRaisesRegex(Refusal, "text"):
+        with self.assertRaisesRegex(Refused, "text"):
             await self.call("file_read", path="sub/bin")
-        with self.assertRaisesRegex(Refusal, "does not exist"):
+        with self.assertRaisesRegex(Refused, "does not exist"):
             await self.call("file_list", path="nowhere")
 
     async def test_hardlinks_and_special_files(self):
@@ -1015,14 +1081,14 @@ class FilesTest(unittest.IsolatedAsyncioTestCase):
         # Same MCP policy: reads may inspect hardlinks; mutations must not affect aliases.
         for name in ("a", "b"):
             self.assertEqual((await self.call("file_read", path="sub/" + name))["content"], "data")
-            with self.assertRaises(Refusal):
+            with self.assertRaises(Refused):
                 await self.call("file_write", path="sub/" + name, content="changed",
                                 expected_sha256=hashlib.sha256(b"data").hexdigest())
         a, b = self.root / "sub" / "a", self.root / "sub" / "b"
         self.assertEqual((a.read_bytes(), b.read_bytes()), (b"data", b"data"))  # the refusals changed neither
         self.assertEqual(a.stat().st_ino, b.stat().st_ino)
         self.assertEqual(a.stat().st_nlink, 2)
-        with self.assertRaises(Refusal):
+        with self.assertRaises(Refused):
             await self.call("file_read", path="sub/pipe")
         (self.root / "sub" / "script").write_text("#!")
         (self.root / "sub" / "script").chmod(0o750)

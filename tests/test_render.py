@@ -11,9 +11,9 @@ from types import SimpleNamespace
 import pytest
 
 import boring_deploy
+from deploy_context import deploy_context
 from test_install import UNITS, host, release  # noqa: F401  (fixtures)
 
-pytestmark = pytest.mark.skipif(sys.version_info < (3, 11), reason="the deploy launcher needs Python 3.11 or newer")
 
 CODE = "/opt/boring-pirates"
 
@@ -57,7 +57,7 @@ def deploy_ctx(host, fails=lambda command: False):
         if fails(command):
             raise boring_deploy.Failure(f"{' '.join(command)} exited 1")
         return SimpleNamespace(stdout="", stderr="", returncode=0)
-    ctx = SimpleNamespace(release=SimpleNamespace(directory=host.release, version="1.1.0"), home=Path(CODE),
+    ctx = deploy_context(release=SimpleNamespace(directory=host.release, version="1.1.0"), home=Path(CODE),
                           run=run, log=logged.append)
     return ctx, calls, logged
 
@@ -179,14 +179,15 @@ def test_a_changed_unit_gets_only_the_drop_in_hint(mo):
 
 def test_a_clean_host_has_no_upgrade_steps(mo):
     ctx, calls, logged = deploy_ctx(mo)
+    assert mo.steps.preflight(ctx) == []
     assert mo.steps.data_generation(ctx) is None
     assert logged == [] and calls == []
 
 
-def test_check_reports_every_shape_of_a_0_3_5_install_at_once(mo):
+def test_check_reports_every_shape_of_a_0_3_5_install_at_once(mo, monkeypatch, capsys):
     """What a public 0.3.5 install leaves: the old keys, context_files, no record.
-    deploy --check runs only step 1, which asks data_generation: all of it is
-    reported there, read-only, before the deploy would refuse one at a time."""
+    deploy --check and deploy ask preflight before any install or preparation;
+    the returned problems are reported together by the engine, read-only."""
     config = mo.config / "mo" / "config.json"
     config.write_text(json.dumps({"provider": "mistral", "socket": "/run/x/pirate.sock", "history_dir": "/var/lib/x",
                                   "key_file": "/etc/x/key", "profiles": {
@@ -195,14 +196,24 @@ def test_check_reports_every_shape_of_a_0_3_5_install_at_once(mo):
     (mo.config / "mo" / "rendered.json").unlink()
     before = snapshot(mo)
     ctx, calls, logged = deploy_ctx(mo)
-    with pytest.raises(boring_deploy.Failure, match="5 things to change first; nothing is changed") as refused:
-        mo.steps.data_generation(ctx)
-    assert "CHANGELOG" in refused.value.hint
-    text = "\n".join(logged)
+    problems = mo.steps.preflight(ctx)
+    assert len(problems) == 5
+    assert mo.steps.data_generation(ctx) is None
+    assert logged == []
+    text = "\n".join(problems)
     for expected in ("remove 'socket'", "remove 'history_dir'", "remove 'key_file'",
                      "flavour default: replace 'context_files' with handbook", "rendered.json is missing"):
         assert expected in text, expected
     assert "flavour other" not in text
+    assert snapshot(mo) == before and calls == []
+    # The engine owns the hint; exercise the real release/preflight seam.
+    import contextlib
+    monkeypatch.setenv("BORING_DEPLOY_TEST", "1")
+    monkeypatch.setattr(boring_deploy, "operation_lock", lambda *a, **k: contextlib.nullcontext())
+    code = boring_deploy.main(mo.release, mo.steps, [str(mo.release.parent / "home"), "--check"])
+    output = capsys.readouterr()
+    assert code == 1 and "5 preflight problems" in output.err
+    assert "CHANGELOG Upgrade notes" in output.err
     assert snapshot(mo) == before and calls == []
 
 
@@ -213,17 +224,18 @@ def test_check_names_units_a_record_without_them_would_refuse(mo):
     record.write_text(json.dumps(document))
     change_template(mo, "boring-pirate-task@.service", "ProtectClock=yes")
     ctx, calls, logged = deploy_ctx(mo)
-    with pytest.raises(boring_deploy.Failure, match="1 thing to change first"):
-        mo.steps.data_generation(ctx)
-    (line,) = logged
+    (line,) = mo.steps.preflight(ctx)
+    assert mo.steps.data_generation(ctx) is None and logged == []
     assert "boring-pirate-task-mo@.service: not named by the record" in line and "sha256sum" in line
     assert calls == []
 
 
 def test_an_unparsable_config_is_reported_by_the_check(mo):
     (mo.config / "mo" / "config.json").write_text("{")
-    with pytest.raises(boring_deploy.Failure, match="1 thing to change first"):
-        mo.steps.data_generation(deploy_ctx(mo)[0])
+    ctx, calls, logged = deploy_ctx(mo)
+    (line,) = mo.steps.preflight(ctx)
+    assert "does not parse" in line
+    assert mo.steps.data_generation(ctx) is None and calls == [] and logged == []
 
 
 @pytest.mark.parametrize("record, message", [

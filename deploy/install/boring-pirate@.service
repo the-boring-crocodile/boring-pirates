@@ -4,6 +4,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+Slice=system-pirate@NAME@.slice
 Type=simple
 User=@ACCOUNT@
 Group=pirate-clients

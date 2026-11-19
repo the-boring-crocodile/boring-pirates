@@ -33,77 +33,62 @@ For a first run, start with [installation](#installing-a-pirate) and
 
 ## Installing a Pirate
 
-A Pirate joins a running Pond that accepts guests (`service_registration_enabled`).
-This page continues the example site of boring-crocodile `docs/INSTALL.md`:
-the Crocodile at `crocodile-url.example.test` with the Ponds `pond` and
-`garden`; here we add the Pirate `parrot`. One command adds a Pirate, also
-next to Pirates already there. From the download to the Pirate, in one
-shell (`V`: the release you install; the newest is on the
-[releases page](https://github.com/the-boring-crocodile/boring-pirates/releases)):
+Follow the family task page, [Add a Pirate](https://github.com/the-boring-crocodile/boring-pond/blob/main/docs/add-pirate.md),
+for download, installation, admission and the first check. This section
+lists first-install settings. Linux runtime requirements are x86_64,
+glibc 2.39 or newer, systemd and Python 3.12+ for deploy.
 
-    V=0.3.11
-    f=boring-pirates-$V-linux-x86_64.tar.gz
-    u=https://github.com/the-boring-crocodile/boring-pirates/releases/download/v$V
-    mkdir -p ~/Downloads && cd ~/Downloads
-    curl -fLO "$u/$f" && curl -fLO "$u/$f.sha256" &&
-    sha256sum -c "$f.sha256" &&            # must print OK; if not, the block stops here
-    sudo mkdir -p /root/releases &&
-    sudo tar xzf "$f" -C /root/releases &&
-    sudo /root/releases/boring-pirates-$V/deploy --install --name parrot --ponds all
+| Setting | Meaning |
+|---|---|
+| `--install --name NAME` | Add that Pirate, including when others are installed; NAME matches `[a-z][a-z0-9]{0,15}` |
+| `--ponds a,b\|all` | Currently enabled Ponds admitted to it |
+| `--account ACCOUNT` | Dedicated account; default pirate-NAME |
+| `--display-name TEXT` | Name shown to clients |
+| `--provider`, `--model` | Inference destination/model; default provider mistral |
+| `--key-file PATH` | Read the provider key instead of entering it privately |
+| `--groups` | Explicit extra Unix groups |
+| `--lab yes` | Add an experimental lab flavour within its configured caps |
 
-The release tags are `vX.Y.Z`; each Linux archive is
-`boring-pirates-X.Y.Z-linux-x86_64.tar.gz`, with a matching `.sha256`.
-A checksum from the same release page detects corruption, not authenticated
-origin. [Recorded combinations](https://github.com/the-boring-crocodile/boring-pond/blob/main/docs/updating.md#releases-and-versions)
-name the Common and Crocodile releases exercised with it.
+A `--key-file` input and its parent directories must be root-owned, with no
+other writer and no symlinks. Stage the key in a protected root-owned folder
+before previewing the install. The preview shows its path, owner and mode;
+it does not show the key.
 
-The shipped Linux runtime targets x86_64 and runs under systemd. Tool
-execution is local to the Pirate's account; inference goes over HTTP to
-the configured Mistral or OpenAI-compatible endpoint. A local endpoint
-still needs its own model server, resources and access policy. Hosted
-providers may charge for calls; installing a Pirate does not supply a
-model subscription.
+The installer creates the account, home/work/handbook, config, state and
+units, and asks the Crocodile for admission with typed APPLY. It keeps the
+provider key root-only; [key configuration](docs/CONFIGURATION.md#the-api-key)
+owns later changes. The release checks its installed Crocodile requirement
+before preparing or switching code. Admission restarts the controller and
+every enabled Pond worker; the shared deploy then restarts the running Pirates.
+Finish or stop affected assignments first. The Pond lists the configured
+Pirate name `NAME`; `--account` selects its Unix identity.
 
-Optional: `--account` (default `pirate-parrot`), `--display-name`,
-`--provider` (default `mistral`), `--model`, `--key-file`, `--groups`,
-`--lab yes` (a second flavour, `lab`, for experiments: no handbook, and each
-run may bring its own system text, tools, turns and settings).
+After installation, `config.json` belongs to the operator. First-install
+settings are refused for an existing Pirate. Admit a later Pond with
+`sudo boring-crocodile-admin pirate-add NAME --ponds a,b --apply`.
+The description records the pairing; the running Pirate discovers and verifies
+its new workers without a configuration edit or Pirate restart:
+[admission reference](https://github.com/the-boring-crocodile/boring-crocodile/blob/main/docs/INSTALL.md#a-pirate-parrot).
 
-It creates the account `pirate-parrot` with `/home/pirate-parrot/work` and
-`handbook/`, its state folder `/var/lib/boring-pirate-parrot` and its API key
-(typed at the terminal unless `--key-file`; kept root-only, changed as
-[CONFIGURATION](docs/CONFIGURATION.md#the-api-key) says), has the Crocodile admit it
-(`boring-crocodile-admin pirate-add`: both Ponds may now call it), writes
-`/etc/boring-pirates/parrot/config.json` with one flavour, `default`, and its
-units (`boring-pirate@parrot.service`, task socket, slice), then deploys. In
-`pond` or `garden`, `pirate_list` now shows `pirate-parrot` with the flavour `default`. From then on
-`config.json` is yours: [CONFIGURATION](docs/CONFIGURATION.md).
-
-A Pond added to the site later is not served by `parrot` until it is offered
-it: the Crocodile's `pirate-add` run again (it names the uids), then
-`client_uids` in `config.json` gains the new Pond's worker and the Pirate
-restarts; it registers with every Pond whose `register.sock` belongs to one of
-`client_uids`. The commands: boring-crocodile
-[INSTALL](https://github.com/the-boring-crocodile/boring-crocodile/blob/main/docs/INSTALL.md#a-pirate-parrot). `deploy
---install` takes no settings for an installed Pirate.
-
-A Pirate serves every Pond it is added for (`--ponds`) alike: with its own
-service grants (not the calling Pond's), one shared `work/` folder and one
-transcript store, so what `parrot` writes for `pond` is there when `garden`
-asks. `--ponds` is the boundary: Ponds that must not share work get separate
-Pirates.
+One Pirate serves its admitted Ponds with one work folder, transcript store
+and its own service grants. Admission grants no service access: follow
+[Let a Pirate call a service](https://github.com/the-boring-crocodile/boring-crocodile/blob/main/docs/SERVICES_AND_PIRATES.md#let-a-pirate-call-a-service).
+Separate Pirates are the boundary for work that must stay apart.
+Continue with [configuration](docs/CONFIGURATION.md)
+or [the result](#a-run-and-its-result).
 
 ## Updating Pirates
 
 All Pirates on a host run the same code from `/opt/boring-pirates`. That keeps
 one maintained runtime, but makes an update a shared interruption: finish or
-stop assignments on all affected Pirates first. Then, in one shell, with
-`V` the release you update to:
+stop assignments on all affected Pirates first. Read the 0.4.0 notes on the
+[releases page](https://github.com/the-boring-crocodile/boring-pirates/releases),
+then run the update block in one shell.
 
-    V=0.3.11
+    V=0.4.0
     f=boring-pirates-$V-linux-x86_64.tar.gz
     u=https://github.com/the-boring-crocodile/boring-pirates/releases/download/v$V
-    mkdir -p ~/Downloads && cd ~/Downloads
+    mkdir -p ~/Downloads && cd ~/Downloads &&
     curl -fLO "$u/$f" && curl -fLO "$u/$f.sha256" &&
     sha256sum -c "$f.sha256" &&            # must print OK; if not, the block stops here
     sudo mkdir -p /root/releases &&
@@ -117,7 +102,9 @@ How deploy checks and switches a release:
 The first command inspects the release and host without changing them; the
 second performs the update. A plain
 `deploy` updates it, restarts every Pirate that runs and pings each of its
-flavours; a stopped Pirate stays stopped and is not pinged (all stopped: `site
+flavours as live registration-socket owners. Only an admitted worker's ping
+can succeed; no admitted live worker means the smoke check fails. A stopped
+Pirate stays stopped and is not pinged (all stopped: `site
 is stopped: not started`).
 
 ### Changed or unrecorded systemd units
@@ -151,13 +138,28 @@ units need restoring from `units-backup-*` for that.
 
 ## Removing a Pirate
 
-`sudo /opt/boring-pirates/current/uninstall --name parrot [--delete-data]` takes
-it out again: it stops the Pirate and its running tasks and removes nothing
-unless they are stopped; its home, state and key stay and are listed. With
-`--delete-data` the home and state are first sealed (root's, mode 0700) and
-then the account goes; a seal that fails keeps the account, and a rerun
-finishes an uninstall that stopped part-way. How deploy, rollback and
-uninstall work: [boring-deploy](https://github.com/the-boring-crocodile/boring-pond-common/blob/main/packages/boring-deploy/README.md).
+Use the Pirates HOME from `/etc/boring-pond/homes.json`; the default command is
+`sudo /opt/boring-pirates/current/uninstall --name parrot`. Answer its initial
+`[y/N]` prompt. It stops the Pirate and its running tasks and removes nothing
+unless they are stopped. If the Crocodile still admits it, the Crocodile shows
+its removal plan and asks for typed APPLY. Admission removal restarts the
+controller and every enabled Pond worker. Other Pirate processes keep running,
+but those worker restarts interrupt their Pond connections.
+
+Home, state, credentials and the account stay and are listed. With
+`--delete-data`, the Crocodile first shows and revokes this name's `pirate/NAME`
+service caller grants and issued tokens, even if admission was removed earlier.
+Then home and state are sealed (root's, mode 0700) and the account goes. You can add this flag after an earlier uninstall:
+`sudo /opt/boring-pirates/current/uninstall --name parrot --delete-data`.
+The retained configuration and account record identify what remains.
+Temporary uninstall keeps service grants; re-admitting that name shows them
+in the Crocodile's plan. Flavour settings stay for you to review before reusing
+a name; the Crocodile owns all service caller grants and roles. Name retirement
+needs a Crocodile whose `pirate-remove` supports `--retire`; an older admin refuses before sealing
+or account removal.
+A failed seal or account removal keeps the account for a retry. Tooling
+never deletes the home or data; inspect and remove them yourself when ready.
+How deploy, rollback and uninstall work: [boring-deploy](https://github.com/the-boring-crocodile/boring-pond-common/blob/main/packages/boring-deploy/README.md).
 
 ## Providers
 
@@ -186,9 +188,15 @@ Tools are granted per flavour (`allowed_tools`; none if omitted):
   Pirate, shared by its flavours;
 - `service_list`, `service_describe`, `service_call`: the Pirate authenticates
   to the Crocodile's service authority by its Unix UID and gets a 60-second
-  token for one service; `allowed_services` can narrow the Pirate's grants,
-  never widen them;
-- `view_image`, so a vision model can look at an image in its roots.
+  token for one service. Omitted `allowed_services` allows every current grant;
+  an explicit list narrows it (`[]`: none). Grant changes need no restart. Command units cannot reach that authority socket; services
+  are called through these tools;
+- `view_image`, so a vision model can look at an image in its roots. One image
+  is attached per turn; another call in that turn is refused before reading it.
+  Ask for the next image in a later turn. The configured provider receives the
+  original file, including embedded metadata such as EXIF/GPS; unlike the
+  Crocodile's file_read_image preview, it is not stripped. Only the latest
+  stays in context.
 
 A new Pirate's first flavour gets the file tools only. Use flavours to give
 one agent different assignments and budgets; use separate Pirates when work
@@ -205,11 +213,31 @@ its own system text, narrow the tools and services, and set the turns and the
 provider settings within the Pirate's `caps` ([CONFIGURATION](docs/CONFIGURATION.md#per-call-overrides)).
 A fixed flavour refuses a run with overrides instead of ignoring them.
 
+## Release set and outcomes
+
+[Outcome causes](OUTCOME_CODES.md) defines local additions and the finite save-wrapper causes.
+
+Install the matching Pirates and Crocodile set in one maintenance window;
+keep Pirate work stopped until both updates are complete. The Pirate release
+declares its Crocodile requirement in `RELEASE.json`. Crocodile's admin supplies the
+Pond and admitted-Pirate inventory. Deploy checks the requirement before preparing
+or switching the release. Wire-format changes bump the minor version.
+Roll back both components together. Unexpected reply envelopes fail with bad_reply.
+
+A socket error is `{"ok":false,"outcome":{...}}`. The outcome is Common's
+flat `{status,code,message,...details}`: refused means nothing started or
+changed; failed means work started and may have had effects. Model tool
+results embed that same object under `refusal` or `failure`; hints and a
+service answer kept under `value` remain outside it. Codes name causes,
+independently of status. Detail values must be JSON at construction.
+
 ## A run and its result
 
 The Crocodile's worker sends `run` over the Pirate's socket (the wire protocol:
 boring-crocodile `docs/SERVICES_AND_PIRATES.md`); the Pirate checks the
-caller's UID against `client_uids`. One assignment per flavour at a time
+caller's UID against an accepted live registration backed by the controller's
+current admission proof. Removed or replaced registration sockets revoke that
+trust; incompatible versions refuse registration. One assignment per flavour at a time
 (`busy` otherwise); different flavours run in parallel. The assignment is
 plain text; Goal / Input / Output / Acceptance headings help but are optional.
 
@@ -239,7 +267,7 @@ model loop, tools, limits, profiles, IPC) and one folder per provider
 settings and request fields over the one HTTP transport in common/chat.py. A
 new provider is a new folder.
 
-`requirements.lock` pins every runtime dependency with hashes for Python 3.10
+`requirements.lock` pins every runtime dependency with hashes for Python 3.12
 to 3.14, Pond Common included (`scripts/lock.py --common-wheels <dist>`).
 Release artifact: `scripts/build.py`.
 

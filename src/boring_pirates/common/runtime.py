@@ -15,7 +15,7 @@ from boring_worker_kit.file_refs import call_service, check_save_to, has_referen
 from boring_worker_kit.execution import EnvironmentExecutor
 from boring_worker_kit.host_limits import read_host_limits
 from boring_worker_kit.local_authority import LocalAuthority
-from boring_worker_kit.outcomes import Refusal
+from boring_worker_kit.outcomes import Refused
 from boring_worker_kit.services import Services
 from boring_worker_kit.tools import FILE_MODELS
 
@@ -49,19 +49,19 @@ class ToolRuntime:
         if name == "exec":
             step = admit_single(name, args)
             if self.executor is None:
-                raise Refusal("forbidden", "exec is not configured for this Pirate instance")
+                raise Refused("forbidden", "exec is not configured for this Pirate instance")
             arguments = step.arguments
             assert isinstance(arguments, ExecArgs)
             return await self.executor.execute(arguments.command, arguments.cwd or str(spec.workdir), arguments.timeout_seconds,
                                                foreground_deadline=deadline)
         if name.startswith("service_"):
             if self.authority is None:
-                raise Refusal("forbidden", "service authority is not configured for this Pirate")
+                raise Refused("forbidden", "service authority is not configured for this Pirate")
             fields = {"service_list": set(), "service_describe": {"service"},
                       "service_call": {"service", "tool", "arguments"}}
             optional = {"service_call": {"save_to"}}.get(name, set())
             if name not in fields:
-                raise Refusal("invalid_request", "unknown service tool")
+                raise Refused("invalid_request", "unknown service tool")
             if not fields[name] <= set(args) <= fields[name] | optional:
                 # Names only, never values: what the tool takes, what was missing, what was extra.
                 takes = ", ".join(sorted(fields[name])) or "no arguments"
@@ -71,20 +71,20 @@ class ToolRuntime:
                     "not arguments of " + name + ": " + ", ".join(extra) if extra else "") if part)
                 nest = (" The service tool's own arguments go inside `arguments`."
                         if name == "service_call" and extra else "")
-                raise Refusal("invalid_request", f"invalid service arguments: {name} takes {takes} ({said}).{nest}")
+                raise Refused("invalid_request", f"invalid service arguments: {name} takes {takes} ({said}).{nest}")
             if name == "service_list":
                 result = await self.authority.request("list")
                 return {"caller": result["caller"], "services": [row for row in result["services"]
-                                                               if row["name"] in spec.allowed_services]}
+                                                               if spec.allows_service(row["name"])]}
             service = args["service"]
-            if not isinstance(service, str) or service not in spec.allowed_services:
-                raise Refusal("forbidden", "service is not allowed by this flavour")
+            if not isinstance(service, str) or not spec.allows_service(service):
+                raise Refused("forbidden", "service is not allowed by this flavour")
             check_save_to(args.get("save_to"))  # a malformed save_to costs no token
             # save_to writes and $file reads: the flavour's tools allow them, not only its file policy.
             if args.get("save_to") is not None and "file_write" not in spec.tools:
-                raise Refusal("forbidden", "save_to writes a file, and this flavour has no file_write")
+                raise Refused("forbidden", "save_to writes a file, and this flavour has no file_write")
             if has_references(args.get("arguments")) and not {"file_read", "file_read_bytes"} & spec.tools:
-                raise Refusal("forbidden", "a $file reference reads a file, and this flavour has neither "
+                raise Refused("forbidden", "a $file reference reads a file, and this flavour has neither "
                               "file_read nor file_read_bytes")
             # Identity/URL/token are obtained afresh from SO_PEERCRED authority, right before
             # the request is sent (after file references and the save target are checked), so a
@@ -112,7 +112,7 @@ class ToolRuntime:
             return await call_service(files.tools, args["arguments"], args.get("save_to"), send, deadline,
                                       max_inline_answer=MAX_TOOL_RESULT - 4096, settle_save=True,
                                       on_late_save=on_cancelled_result)
-        raise Refusal("invalid_request", "unknown tool")
+        raise Refused("invalid_request", "unknown tool")
 
     async def close(self) -> None:
         if self.services is not None:

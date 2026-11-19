@@ -38,10 +38,12 @@ class Caps:
         return {"max_turns": self.max_turns, "max_output_tokens": self.max_output_tokens}
 
 
-def _subset(raw: Any, allowed: frozenset[str], what: str) -> frozenset[str]:
+def _subset(raw: Any, allowed: frozenset[str] | None, what: str) -> frozenset[str]:
     if (not isinstance(raw, list) or any(not isinstance(x, str) for x in raw)
             or len(set(raw)) != len(raw)):
         raise ValueError(f"overrides.{what} must be a list of distinct names")
+    if allowed is None:
+        return frozenset(raw)
     outside = sorted(set(raw) - allowed)
     if outside:
         raise ValueError(f"overrides.{what}: {outside} are not among this flavour's "

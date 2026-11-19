@@ -16,6 +16,7 @@ standalone CPython, deploy; see boring_deploy) that `sudo <unpacked>/deploy`
 installs into /opt/boring-pirates.
 """
 import hashlib
+import runpy
 import sys
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from _develop import load
 artifact, develop = load()
 
 ROOT = Path(__file__).resolve().parent.parent
+CROCODILE_REQUIRES = runpy.run_path(ROOT / "src/boring_pirates/common/compatibility.py")["CROCODILE_REQUIRES"]
 
 
 def main():
@@ -51,6 +53,7 @@ def main():
     files["deploy.d/pirate_units.py"] = ROOT / "deploy" / "pirate_units.py"  # shared by steps and install
     release = {"component": "boring-pirates", "version": version, "runtime": "venv",
                "default_home": "/opt/boring-pirates", "python": "python.tar.gz",
+               "requires": {"boring-crocodile": CROCODILE_REQUIRES},
                "commit": develop.git(ROOT, "rev-parse", "HEAD").strip()}
     archive = artifact.assemble(top, release, ROOT / "deploy" / "steps.py", files,
                                 install=ROOT / "deploy" / "install.py")

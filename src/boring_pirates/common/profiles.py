@@ -55,7 +55,7 @@ class ProfileSpec:
     tools: frozenset[str]
     max_turns: int
     files: FilePolicy  # parse_profiles always sets one: the flavour's, or `work` at its workdir
-    allowed_services: frozenset[str] = frozenset()
+    allowed_services: frozenset[str] | None = None  # None: all current Crocodile grants
     options: tuple[tuple[str, object], ...] = ()  # the provider block as its folder checked it
     # Budgets the assignment loop enforces; None: no budget.
     max_service_calls: int | None = None  # service_call refused after this many in one assignment
@@ -79,12 +79,16 @@ class ProfileSpec:
                 "allowed_tools": sorted(self.tools), "max_turns": self.max_turns,
                 "files": self.files.public(),
                 "file_policy_sha256": self.file_policy_identity(),
-                "allowed_services": sorted(self.allowed_services),
+                "allowed_services": None if self.allowed_services is None else sorted(self.allowed_services),
                 "max_service_calls": self.max_service_calls,
                 "write_reminder_after": self.write_reminder_after,
                 "digest_file": None if self.digest_file is None else str(self.digest_file),
                 **({"allow_overrides": True} if self.allow_overrides else {}),  # a fixed flavour's text unchanged
                 self.provider: self.settings}
+
+    def allows_service(self, name: str) -> bool:
+        """The local restriction only; Crocodile owns the actual current grant."""
+        return self.allowed_services is None or name in self.allowed_services
 
     def context_identity(self) -> list[dict]:
         """The context files as they are now: paths and sha256, not contents."""
@@ -220,8 +224,8 @@ def parse_profiles(raw: object, checkout: Path, provider: object, *,
         if (not isinstance(tools, list) or any(not isinstance(t, str) for t in tools)
                 or len(tools) != len(set(tools)) or not set(tools) <= TOOLS):
             raise ValueError(f"profile {name}: invalid allowed_tools")
-        services = value.get("allowed_services", [])
-        if not isinstance(services, list) or any(not isinstance(x, str) or not FLAVOUR.fullmatch(x) for x in services) or len(set(services)) != len(services):
+        services = value.get("allowed_services")
+        if "allowed_services" in value and (not isinstance(services, list) or any(not isinstance(x, str) or not FLAVOUR.fullmatch(x) for x in services) or len(set(services)) != len(services)):
             raise ValueError('invalid flavour service allowances')
         options = folder.settings(value.get(provider), name)
         budgets = {key: None if value.get(key) is None else positive_integer(value[key], f"profile {name}: {key}")
@@ -231,7 +235,7 @@ def parse_profiles(raw: object, checkout: Path, provider: object, *,
         specs[name] = ProfileSpec(
             name, value["active"], str(provider), model, workdir, files, frozenset(tools),
             positive_integer(value.get("max_turns", DEFAULT_MAX_TURNS), "max_turns"),
-            files_policy, frozenset(services), tuple(sorted(options.items())), **budgets,
+            files_policy, None if services is None else frozenset(services), tuple(sorted(options.items())), **budgets,
             digest_file=digest_file, allow_overrides=allow_overrides)
     if not any(spec.active for spec in specs.values()):
         raise ValueError("no profile is active")

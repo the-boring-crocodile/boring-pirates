@@ -12,7 +12,6 @@ The file holds no secret.
 {
   "provider": "mistral",
   "checkout": "/home/ACCOUNT/work",
-  "client_uids": [1001],
   "descriptor_file": "/home/ACCOUNT/handbook/descriptor.json",
   "default_timeout_seconds": 120,
   "max_timeout_seconds": 600,
@@ -49,8 +48,7 @@ The file holds no secret.
 | `provider` | mistral or openai_compat. One provider per Pirate. |
 | `provider_endpoint` | HTTP(S) API base URL, required for openai_compat; refused for mistral. Routing/access policy belongs to the deployment. |
 | `checkout`, `descriptor_file` | Where it works and finds its self-description. |
-| `client_uids` | The Pond workers allowed to give it work; `pirate-add` names them. |
-| `service_authority` | The Crocodile's service authority socket and UID, from `pirate-add`. Optional. |
+| `service_authority` | Required: the Crocodile controller's authority socket and UID, from `pirate-add`. Used to verify Pond registration identities and obtain service grants. |
 | timeouts, `retention_seconds` | Assignment default and maximum, one provider request, how long transcripts are kept. |
 | `execution` | Where its commands run (`exec`): working roots, task socket, units, slice, output limit. Optional; without it no flavour can have `exec`. |
 | `caps` | Upper bounds for per-call overrides: `max_turns` (default 60) and `max_output_tokens` (default 8192). Optional. |
@@ -64,6 +62,26 @@ them to the Pirate. The socket is `$RUNTIME_DIRECTORY/pirate.sock`
 (`LoadCredential=`; the key itself is in `/etc/boring-pirates/NAME/credentials/`,
 root only). `socket`, `history_dir` and `key_file` in config.json are refused
 (before 0.3.9 they were required: remove them when you upgrade).
+
+## Pond admission
+
+The Crocodile description owns each Pirate's admitted `ponds` under
+`[pirate_services.callers.NAME]`. `pirate-add NAME --ponds a,b` adds Ponds to
+an existing Pirate. There is no worker UID list in the Pirate configuration;
+legacy `client_uids` is refused.
+
+Discovery alone grants no access. Before registration the Pirate asks the
+configured controller to vouch for its admission and the registration socket's
+worker UID, then verifies that socket's actual peer UID. It sends its installed
+version and trusts the worker only after an explicit acceptance naming the
+Pirate and Pond. The Crocodile checks the Pirate's version at registration;
+a refusal names the unsupported version and required range. The Pirate's
+ordinary deploy requirement sets its Crocodile floor.
+
+A removed or replaced registration socket loses its accepted identity. Before
+handling work the Pirate also verifies that the controller still admits the
+pair, so a lingering worker socket cannot preserve a withdrawn grant. An
+unavailable controller prevents that request from running.
 
 ## The API key
 
@@ -109,13 +127,21 @@ Each entry of `profiles` is one flavour; only `active` ones are offered.
 | `handbook` | One file, or null: what the model is told first. Read at the start of every assignment; its hash is recorded. It must lie outside the checkout. Never give a flavour a writable file root over it (or over its digest_file): the model could rewrite the rules every later run starts from. exec cannot, its sandbox keeps the home read-only except the work root; the installer makes `handbook/` root's (readable by the Pirate's group). |
 | `allow_overrides` | Default false. True: a run may carry `overrides` (below); false: a run with overrides is refused `forbidden`, never run without them. |
 | `allowed_tools` | Omitted: no tools. |
-| `allowed_services` | Omitted: no services. Narrows the Pirate's grants. |
+| `allowed_services` | Omitted: every service currently granted to the Pirate. A list narrows those grants; `[]` allows none. |
 | `files` | File roots (named, read/write, deny, limits; the Crocodile's file policy). Omitted: one root `work` at `workdir`. Roots may not overlap. A root may be as wide as `/` (read-only, for looking around); the Pirate's UID and its units' sandbox are the boundary. A root strictly inside the checkout is refused (the Pirate can replace folders there, and the root's own path is resolved once, at start), so a flavour with another `workdir` than `.` needs explicit roots. Protected directories: the key's, the state directory (the transcripts), `/run/credentials`, `/proc`, `/sys` and `/dev`. A root equal to or inside one is refused; a root containing one gets it as a `deny` entry automatically. They stay protected because the file tools run inside the Pirate process, which holds the key (its own memory is readable to it under `/proc`) and writes the transcripts. |
 | `max_turns` | Default 12. |
 | `max_service_calls` | Optional: after this many `service_call`s in one assignment, further ones are refused with a message to write the result. |
 | `write_reminder_after` | Optional: after this many tool calls without a file write, one user message asks to write the result now. |
 | `digest_file` | Optional: a short text file (at most 4 KiB, outside the checkout) of key rules. On every model call it is appended to the end of the last message (the prompt on the first call, then the latest tool result) and not kept in the conversation, so the rules stay next to the answer in long assignments without reading as a new task. Its sha256 is part of the profile revision. |
 | `"mistral": {...}` | The provider's own settings: `max_tokens` (default 8192), `temperature`, `reasoning_effort`, `top_p`, `random_seed`, `stop`, `presence_penalty`, `frequency_penalty`, `safe_prompt`, `service_tier`, `prompt_mode`, and `stream` (default true: streamed, with the idle timeout; false: one answer at the end). Only the provider folder knows these; another provider has its own block. |
+
+A flavour needs service tools in `allowed_tools`. Crocodile owns the service
+and role grants; `allowed_services` is only an optional local restriction.
+Grant changes need no Pirate restart: listing and tokens read the current
+Crocodile authority. A flavour description reports `allowed_services: null`
+when there is no local restriction; use `service_list` for actual grants.
+Follow [Let a Pirate call a service](https://github.com/the-boring-crocodile/boring-crocodile/blob/main/docs/SERVICES_AND_PIRATES.md#let-a-pirate-call-a-service).
+Restart only when changing the Pirate configuration itself.
 
 ## Per-call overrides
 
@@ -128,7 +154,7 @@ and output tokens may go above the flavour's own values, up to the Pirate's
 | Key | |
 |---|---|
 | `system` | Text (at most 32 KiB) that replaces the handbook for this run. |
-| `tools`, `services` | Subsets of the flavour's `allowed_tools`, `allowed_services`. |
+| `tools`, `services` | Only narrow the flavour. With no local service restriction, an explicit list selects within current Crocodile grants; it grants nothing by itself. |
 | `max_turns` | 1 to `caps.max_turns`. |
 | `settings` | The provider block for this run, merged over the flavour's and checked by the provider folder; `max_tokens` at most `caps.max_output_tokens`. Any key of the block can change (for Mistral also `safe_prompt` and `stream`). |
 
@@ -235,6 +261,9 @@ systemd-run --wait --pipe --quiet --collect -p User=ACCOUNT -p Group=pirate-clie
   /opt/boring-pirates/current/bin/boring-pirate check-config \
   --config /etc/boring-pirates/NAME/config.json
 ```
+
+For the OpenAI-compatible provider, set PROVIDER to `openai_compat`.
+The credential name and file basename are both `openai_compat-api-key`.
 
 Inside such a unit the key is `$CREDENTIALS_DIRECTORY/PROVIDER-api-key`, and
 check-config checks it there (present, not empty); a

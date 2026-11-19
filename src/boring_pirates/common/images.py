@@ -17,7 +17,7 @@ import hashlib
 import struct
 from typing import Any
 
-from boring_worker_kit.outcomes import Refusal
+from boring_worker_kit.outcomes import Refused
 
 # A data URL of this size is about 1 MiB in the conversation (the limit is 2 MiB).
 MAX_IMAGE_BYTES = 768 * 1024
@@ -27,7 +27,9 @@ CHUNK = 65536
 DEFINITION = {
     "name": "view_image",
     "description": ("Look at a PNG or JPEG file from a named root: it is attached to your next turn as an image. "
-                    "Render SVG or diagrams to PNG first. Only the latest image stays in the conversation."),
+                    "Render SVG or diagrams to PNG first. At most one image per turn; ask again on a later turn. "
+                    "Your configured model provider receives the original file, including embedded metadata such as EXIF/GPS. "
+                    "Only the latest image stays in the conversation."),
     "parameters": {"type": "object", "properties": {"root": {"type": "string"}, "path": {"type": "string"}},
                    "required": ["root", "path"], "additionalProperties": False}}
 NOTE = "[an earlier image was here; only the latest image stays in the conversation]"
@@ -52,8 +54,8 @@ def dimensions(data: bytes) -> tuple[str, int, int]:
                 height, width = struct.unpack(">HH", data[at + 5:at + 9])
                 return "image/jpeg", width, height
             at += 2 + length
-        raise Refusal("invalid_request", "JPEG without a readable frame header")
-    raise Refusal("invalid_request", "view_image takes PNG or JPEG files (render SVG to PNG first)")
+        raise Refused("invalid_request", "JPEG without a readable frame header")
+    raise Refused("invalid_request", "view_image takes PNG or JPEG files (render SVG to PNG first)")
 
 
 async def read_image(files: Any, call_id: str, root: str, path: str) -> tuple[dict[str, Any], str]:
@@ -64,16 +66,16 @@ async def read_image(files: Any, call_id: str, root: str, path: str) -> tuple[di
                                                            "root": root, "path": path, "offset": offset,
                                                            "length": CHUNK})
         if chunk["bytes"] > MAX_IMAGE_BYTES:
-            raise Refusal("limit", f"image is {chunk['bytes']} bytes; view_image takes up to {MAX_IMAGE_BYTES}")
+            raise Refused("limit", f"image is {chunk['bytes']} bytes; view_image takes up to {MAX_IMAGE_BYTES}")
         data += base64.b64decode(chunk["data"])
         offset += chunk["length"]
         if chunk["eof"] or not chunk["length"]:
             break
     if hashlib.sha256(data).hexdigest() != chunk["sha256"]:
-        raise Refusal("busy", "the image changed while it was read; try again")
+        raise Refused("stale", "the image changed while it was read; try again")
     media, width, height = dimensions(data)
     if not 0 < width <= MAX_SIDE or not 0 < height <= MAX_SIDE or width * height > MAX_PIXELS:
-        raise Refusal("limit", f"image is {width}x{height}; view_image takes up to {MAX_SIDE} px a side "
+        raise Refused("limit", f"image is {width}x{height}; view_image takes up to {MAX_SIDE} px a side "
                                f"and {MAX_PIXELS} pixels")
     value = {"attached": True, "root": root, "path": path, "media_type": media, "bytes": len(data),
              "width": width, "height": height, "sha256": chunk["sha256"]}

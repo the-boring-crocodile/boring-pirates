@@ -12,6 +12,7 @@ import sys
 import time
 
 from test_pirates import make_site, unit_environment, Script, tool_call
+from registration_fixture import register_fixture
 from boring_pirates.common.runtime import ToolRuntime
 from boring_worker_kit.execution import EnvironmentExecutor
 from boring_worker_kit.host_limits import HostLimits
@@ -49,7 +50,12 @@ async def fixture(root, mode):
             "boring-pirate-task-parrot", Path("/system.slice/system-pirateparrot.slice"), 1024)
         parrot.runtime = ToolRuntime(executor=EnvironmentExecutor(execution,
             HostLimits(task_slots=1, job_timeout_seconds=30)))
-    await serve_instance(parrot)
+    registration = await register_fixture(root, parrot)
+    try:
+        await serve_instance(parrot)
+    finally:
+        registration.close()
+        await registration.wait_closed()
 
 @pytest.mark.parametrize("mode", ["generation", "exec", "exec_disconnect"])
 def test_sigterm_settles_assignment_before_exiting(tmp_path, mode):
